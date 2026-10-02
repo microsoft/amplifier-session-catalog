@@ -278,3 +278,33 @@ def test_query_work_does_not_scale_with_invisible_estate(catalog, tmp_path):
             (f"ahp-session:/hidden-{i}", "amplifier", str(i), missing, None, "root", "Archived",
              1, 100000+i, "available", "fixture", None, None, None, None, 1, "{}", 0) for i in range(25000)])
     assert measure() <= baseline + 30
+
+
+def test_native_visibility_is_filtered_before_paging_and_not_revived_by_metadata(catalog, tmp_path):
+    workspace=tmp_path/'workspace';workspace.mkdir()
+    for i in range(80): catalog.upsert(record(workspace,i))
+    for i in range(30,80):
+        catalog.set_visibility(uri=f'ahp-session:/{i:08d}',nativeSessionId=str(i),workingDirectory=str(workspace),deleted=True,commandId=f'delete-{i}',evidence='native-completed-receipt')
+    first=catalog.list(connectionId='deleted',limit=20)
+    assert len(first['items'])==20 and first['items'][0]['nativeSessionId']=='29'
+    assert len(catalog.list(connectionId='archive',includeArchive=True)['items'])==30
+    catalog.upsert(record(workspace,79));catalog.workspace(str(workspace),availability='missing');catalog.workspace(str(workspace),availability='present')
+    assert catalog.list(connectionId='deleted')['items'][0]['nativeSessionId']=='29'
+    with pytest.raises(ValueError):catalog.set_visibility(uri='ahp-session:/00000079',nativeSessionId='foreign',workingDirectory=str(workspace),deleted=False,commandId='restore',evidence='native-completed-receipt')
+    catalog.set_visibility(uri='ahp-session:/00000079',nativeSessionId='79',workingDirectory=str(workspace),deleted=False,commandId='restore',evidence='native-completed-receipt')
+    assert catalog.list(connectionId='restored')['items'][0]['nativeSessionId']=='79'
+
+
+def test_configured_native_lifecycle_markers_are_bounded_and_identity_checked(catalog,tmp_path):
+    workspace=tmp_path/'work';workspace.mkdir();home=tmp_path/'home';app=tmp_path/'app'
+    directory=native_session(home,workspace,'root')
+    discovery=Discovery(catalog,[home],known_workspaces=[workspace],app_homes=[app])
+    discovery.hint(str(directory));uri=catalog.list(connectionId='one')['items'][0]['uri']
+    marker=app/'sessions/root/lifecycle.json';marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({'sessionId':'root','historyCwd':str(workspace),'deleted':True,'commandId':'native-delete'}))
+    discovery.hint(str(directory));assert catalog.list(connectionId='hidden')['items']==[]
+    marker.write_text(json.dumps({'sessionId':'foreign','historyCwd':str(workspace),'deleted':False,'commandId':'foreign-restore'}))
+    assert discovery.hint(str(directory))['issues'];assert catalog.list(connectionId='still-hidden')['items']==[]
+    marker.write_text(json.dumps({'sessionId':'root','historyCwd':str(workspace),'deleted':False,'commandId':'native-restore'}))
+    discovery.hint(str(directory));assert catalog.list(connectionId='restored')['items'][0]['uri']==uri
+    assert (directory/'transcript.jsonl').exists()

@@ -105,3 +105,20 @@ component evidence, not Spark-1 scale or real-account execution acceptance.
 25,000 and 100,000 sessions, then measures paged reads and individual summary
 updates in fresh processes. It reports its evidence boundary with the results;
 the fixture paths do not touch real native history.
+
+Native lifecycle visibility is a separate derived index. `setVisibility` accepts
+an exact indexed `uri`, `nativeSessionId`, `workingDirectory`, `deleted` boolean,
+`commandId`, and evidence `native-completed-receipt` (trusted host after native
+confirmation) or `configured-native-marker` (discovery). It changes discovery
+only; canonical files are never modified. Deleted rows are excluded before
+paging, including archive browsing. Ordinary metadata updates and workspace
+rechecks cannot revive them. Exact lookup reports `nativeDeleted` and retains
+history references for directory-removal guards.
+
+Configure repeated `--app-home` arguments with each explicit native ACP adapter
+state home to discover out-of-band lifecycle markers at
+`<appHome>/sessions/<nativeSessionId>/lifecycle.json`. Hints and periodic scanning
+read only bounded, identity-matching markers, never transcript/event bodies.
+There is no guessed user home. Invalid markers retain previous visibility and
+produce an issue. A confirmed native restore marker or receipt re-enables the
+row; an absent marker is not restore evidence.

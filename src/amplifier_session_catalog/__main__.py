@@ -18,7 +18,7 @@ class Server:
         self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert,
                         "workspace": catalog.workspace, "recheck": catalog.recheck_workspaces,
                         "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
-                        "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use}
+                        "setVisibility": catalog.set_visibility, "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use}
 
     def handle(self, request):
         identity = request.get("id") if isinstance(request, dict) else None
@@ -78,6 +78,7 @@ def main():
     parser.add_argument("command", choices=("serve", "scan", "list"))
     parser.add_argument("--db", required=True)
     parser.add_argument("--home", action="append", default=[])
+    parser.add_argument("--app-home", action="append", default=[], help="Explicit native adapter state home for lifecycle visibility markers")
     parser.add_argument("--workspace", action="append", default=[])
     parser.add_argument("--engine", default="amplifier")
     parser.add_argument("--scan-on-start", action="store_true")
@@ -87,7 +88,7 @@ def main():
                         help="Seconds between bounded workspace existence checks; zero disables")
     args = parser.parse_args()
     catalog = Catalog(args.db)
-    discovery = Discovery(catalog, args.home, known_workspaces=args.workspace, engine_id=args.engine)
+    discovery = Discovery(catalog, args.home, known_workspaces=args.workspace, engine_id=args.engine, app_homes=args.app_home)
     if args.command == "serve":
         if args.scan_interval < 0 or args.workspace_check_interval < 0:
             parser.error("maintenance intervals cannot be negative")

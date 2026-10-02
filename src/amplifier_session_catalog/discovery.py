@@ -84,11 +84,12 @@ def file_stamp(path):
 
 
 class Discovery:
-    def __init__(self, catalog: Catalog, homes, *, known_workspaces=(), engine_id="amplifier"):
+    def __init__(self, catalog: Catalog, homes, *, known_workspaces=(), engine_id="amplifier", app_homes=()):
         self.catalog = catalog
         self.homes = tuple(Path(home).expanduser().resolve() for home in homes)
         self.known = {project_slug(path): str(Path(path).expanduser().resolve()) for path in known_workspaces}
         self.engine_id = engine_id
+        self.app_homes = tuple(Path(home).expanduser().resolve() for home in app_homes)
         self.stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -113,7 +114,9 @@ class Discovery:
         previous = self.catalog.by_storage(directory)
         stamps = [file_stamp(directory / name) for name in METADATA]
         transcript = file_stamp(directory / "transcript.jsonl") or file_stamp(directory / "transcript.jsonl.backup")
-        fingerprint = hashlib.sha256(json.dumps([stamps, transcript]).encode()).hexdigest()
+        markers = [(root / "sessions" / identity / "lifecycle.json") for root in self.app_homes]
+        marker_stamps = [file_stamp(path) for path in markers]
+        fingerprint = hashlib.sha256(json.dumps([stamps, transcript, marker_stamps]).encode()).hexdigest()
         if previous and previous["fingerprint"] == fingerprint and not force:
             if run:
                 self.catalog.touch_seen(previous["uri"], run)
@@ -188,6 +191,21 @@ class Discovery:
         if issues:
             record["reason"] = "; ".join(issues)[:8192]
         self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run)
+        for path, stamp in zip(markers, marker_stamps):
+            if not stamp: continue
+            try:
+                if stamp[2] > 65536 or any(part.is_symlink() for part in (path, *path.parents)):
+                    raise ValueError("Unsafe native lifecycle marker")
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as stream: raw = stream.read(65537)
+                if len(raw) > 65536: raise ValueError("Oversized lifecycle marker")
+                marker = json.loads(raw)
+                if marker.get("sessionId") != identity or marker.get("historyCwd") != workspace:
+                    raise ValueError("Lifecycle marker identity does not match native history")
+                self.catalog.set_visibility(uri=uri, nativeSessionId=identity, workingDirectory=workspace,
+                    deleted=marker["deleted"], commandId=marker["commandId"], evidence="configured-native-marker")
+            except (OSError, ValueError, KeyError, TypeError):
+                issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         return {"uri": uri, "changed": True, "issues": issues}
 
     @staticmethod

@@ -88,9 +88,11 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS storage_lookup ON sessions(storage_path);
                 CREATE INDEX IF NOT EXISTS native_lookup ON sessions(engine, native_id, workspace);
                 CREATE INDEX IF NOT EXISTS source_sessions ON sessions(source, seen_run);
-                CREATE TRIGGER IF NOT EXISTS workspace_visibility AFTER UPDATE OF availability ON workspaces
+                CREATE TABLE IF NOT EXISTS native_visibility (uri TEXT PRIMARY KEY, deleted INTEGER NOT NULL, command_id TEXT NOT NULL, evidence TEXT NOT NULL);
+                DROP TRIGGER IF EXISTS workspace_visibility;
+                CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
                     WHEN OLD.availability <> NEW.availability BEGIN
-                    UPDATE sessions SET visible=(NEW.availability='present') WHERE workspace=NEW.path;
+                    UPDATE sessions SET visible=(NEW.availability='present' AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
                 END;
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
@@ -156,6 +158,7 @@ class Catalog:
             self.workspace(workspace)
         with self.connect() as db:
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
+            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,native_id=excluded.native_id,
                 workspace=excluded.workspace,parent_uri=excluded.parent_uri,kind=excluded.kind,
@@ -167,6 +170,21 @@ class Catalog:
                  source, storage, record.get("nativeProject"), fingerprint, seen_run, now, raw, visible))
         return self.get(uri)
 
+    def set_visibility(self, *, uri, nativeSessionId, workingDirectory, deleted, commandId, evidence):
+        """Derived visibility only, after exact storage-owner confirmation. No file mutation."""
+        current = self.get(checked_string(uri, "uri", 512))
+        if not current or current["nativeSessionId"] != nativeSessionId or current["workingDirectory"] != workingDirectory:
+            raise ValueError("Native visibility identity does not match indexed session")
+        if type(deleted) is not bool:
+            raise ValueError("Native deletion state must be boolean")
+        checked_string(commandId, "commandId", 200)
+        if evidence not in {"native-completed-receipt", "configured-native-marker"}:
+            raise ValueError("Confirmed native visibility evidence required")
+        with self.connect() as db:
+            db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(deleted), commandId, evidence))
+            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present')) WHERE uri=?", (int(deleted), uri))
+        return {"uri": uri, "deleted": deleted, "commandId": commandId}
+
     @staticmethod
     def _record(row):
         if row is None:
@@ -175,7 +193,7 @@ class Catalog:
                   "workingDirectory": row["workspace"], "title": row["title"], "kind": row["kind"],
                   "createdAt": iso(row["created_at"]), "modifiedAt": iso(row["modified_at"]),
                   "availability": row["availability"], "workspaceAvailability": row["workspace_availability"],
-                  "indexedAt": iso(row["indexed_at"]), "status": "idle"}
+                  "indexedAt": iso(row["indexed_at"]), "status": "idle", "nativeDeleted": bool(row["native_deleted"]) if "native_deleted" in row.keys() else False}
         if row["parent_uri"]:
             result["parentUri"] = row["parent_uri"]
         if row["storage_path"]:
@@ -186,7 +204,7 @@ class Catalog:
     def get(self, uri):
         checked_string(uri, "uri", 512)
         with self.connect() as db:
-            row = db.execute("SELECT s.*, w.availability AS workspace_availability FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
+            row = db.execute("SELECT s.*, w.availability AS workspace_availability, EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AS native_deleted FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
         return self._record(row)
 
     def by_storage(self, path):
@@ -297,6 +315,8 @@ class Catalog:
                  "parent": parentUri, "archive": includeArchive, "roots": roots}
         scope = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
         where, args = [], []
+        if includeArchive:
+            where.append("NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1)")
         if not includeArchive:
             where.append("s.visible=1")
         if parentUri:
