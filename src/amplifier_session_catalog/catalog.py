@@ -194,6 +194,29 @@ class Catalog:
             row = db.execute("SELECT uri,fingerprint FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
         return dict(row) if row else None
 
+    def directory_in_use(self, *, path):
+        """Indexed historical references, not a lease on external agent writers.
+
+        The trusted host supplies a canonical absolute path and holds its own
+        admission/deletion guard. Include hidden children and archived workspaces;
+        browsing visibility must never grant permission to remove native history.
+        """
+        path = checked_string(path, "path")
+        if not Path(path).is_absolute() or os.path.normpath(path) != path:
+            raise ValueError("path must be canonical and absolute")
+        prefix = path.rstrip("/") + "/"
+        upper = prefix[:-1] + "0"
+        with self.connect() as db:
+            rows = db.execute("""SELECT uri,workspace,storage_path FROM sessions
+                WHERE workspace=? OR (workspace>=? AND workspace<?)
+                   OR storage_path=? OR (storage_path>=? AND storage_path<?)
+                LIMIT 101""", (path, prefix, upper, path, prefix, upper)).fetchall()
+        return {"inUse": bool(rows), "sessions": [
+            {"session": row["uri"], "reason": "history-workspace" if
+             row["workspace"] == path or row["workspace"].startswith(prefix) else "native-history-storage"}
+            for row in rows[:100]], "truncated": len(rows) > 100,
+            "coverage": "indexed-native-history", "freshness": self.progress()}
+
     def resolve_native(self, *, engineId, identities, allowedWorkspaceRoots):
         """Bounded migration lookup; never guess an ambiguous native identity."""
         checked_string(engineId, "engineId", 200)

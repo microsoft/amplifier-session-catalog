@@ -49,6 +49,50 @@ def test_filter_is_before_page_and_children_are_explicit(catalog, tmp_path):
     assert catalog.get(record(missing, 10)["uri"])["workspaceAvailability"] == "missing"
 
 
+def test_directory_guard_includes_hidden_history_and_respects_path_boundaries(catalog, tmp_path, monkeypatch):
+    target = tmp_path / "managed"
+    catalog.upsert(record(target / "child", 1, parentUri="ahp-session:/parent"))
+    catalog.upsert(record(tmp_path / "elsewhere", 2, kind="internal", storagePath=str(target / "native" / "two")))
+    catalog.upsert(record(tmp_path / "managed-other", 3))
+    # Removal checks must neither stat each historical directory nor open native history.
+    monkeypatch.setattr(Path, "stat", lambda *a, **k: (_ for _ in ()).throw(AssertionError("guard performed stat")))
+    monkeypatch.setattr(Path, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError("guard read native history")))
+    result = catalog.directory_in_use(path=str(target))
+    assert result["inUse"] and not result["truncated"]
+    assert {row["session"]: row["reason"] for row in result["sessions"]} == {
+        "ahp-session:/00000001": "history-workspace", "ahp-session:/00000002": "native-history-storage"}
+    assert result["coverage"] == "indexed-native-history"
+    assert result["freshness"]["phase"] == "not-started"
+    assert not catalog.directory_in_use(path=str(tmp_path / "unused"))["inUse"]
+    with pytest.raises(ValueError):
+        catalog.directory_in_use(path="relative")
+
+
+def test_directory_guard_is_bounded_on_large_cold_catalog(catalog, tmp_path, monkeypatch):
+    root = tmp_path / "cold"
+    catalog.upsert(record(root, 1))
+    with catalog.connect() as db:
+        db.execute("""WITH RECURSIVE ids(n) AS (VALUES(2) UNION ALL SELECT n+1 FROM ids WHERE n<25000)
+            INSERT INTO sessions SELECT printf('ahp-session:/%08d',n),engine,printf('%d',n),workspace,
+            parent_uri,kind,title,created_at,modified_at,availability,source,storage_path,native_project,
+            fingerprint,seen_run,indexed_at,details,visible FROM ids,sessions WHERE uri='ahp-session:/00000001'""")
+    original = catalog.connect
+    @contextmanager
+    def bounded_query():
+        with original() as db:
+            calls = 0
+            def steps():
+                nonlocal calls
+                calls += 1
+                return calls > 500
+            db.set_progress_handler(steps, 100)
+            yield db
+    monkeypatch.setattr(catalog, "connect", bounded_query)
+    assert not catalog.directory_in_use(path=str(tmp_path / "absent"))["inUse"]
+    result = catalog.directory_in_use(path=str(root))
+    assert result["inUse"] and result["truncated"] and len(result["sessions"]) == 100
+
+
 def test_query_does_not_restat_or_read_native_files(catalog, tmp_path, monkeypatch):
     catalog.upsert(record(tmp_path, 1))
     monkeypatch.setattr(Path, "stat", lambda *a, **k: (_ for _ in ()).throw(AssertionError("query performed stat")))

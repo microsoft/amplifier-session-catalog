@@ -59,6 +59,14 @@ authorization and passes its authorized workspace roots to list queries.
 | `recheck` | Revalidate up to `limit` oldest workspace existence facts; returns updated facts. Normally the service schedules this outside interactive request latency |
 | `workspace` | Explicit `{path,availability?}` refresh; availability values present/missing/unknown. Used for known offline sources as well as normal probes |
 | `resolveNative` | One-time migration lookup: `{engineId,identities,allowedWorkspaceRoots}` (at most 500 identities). Indexed, scoped results map IDs to `{status:"matched",uri}`, `ambiguous`, or `missing`. No filesystem scan, guessed path, or selection of one ambiguous match |
+| `directoryInUse` | Trusted-host guard input `{path}` for a canonical absolute directory. Indexed exact/descendant workspace and native storage matches include archived, child and internal sessions. Returns `{inUse,sessions,truncated,coverage,freshness}`, with at most 100 explanations. No filesystem scan or native reads |
+
+Directory-use coverage is explicitly `indexed-native-history`. An empty result
+does not exclude an undiscovered or noncooperating external writer. The host owns
+atomic create/relocate/remove admission and any native ownership checks. Discovery
+freshness is `phase: not-started|running|complete|interrupted|failed`; scan reports
+include `issues`, `startedAt`, and `completedAt` when settled. A destructive caller
+must handle incomplete, issue-bearing and stale discovery conservatively.
 
 Records contain `uri`, `engineId`, `nativeSessionId`, `workingDirectory`, `title`,
 `createdAt`, `modifiedAt`, `indexedAt`, `kind` (root/child/internal),
