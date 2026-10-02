@@ -194,6 +194,28 @@ class Catalog:
             row = db.execute("SELECT uri,fingerprint FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
         return dict(row) if row else None
 
+    def resolve_native(self, *, engineId, identities, allowedWorkspaceRoots):
+        """Bounded migration lookup; never guess an ambiguous native identity."""
+        checked_string(engineId, "engineId", 200)
+        if not isinstance(identities, list) or len(identities) > 500:
+            raise ValueError("identities must contain at most 500 native IDs")
+        identities = list(dict.fromkeys(checked_string(value, "native ID", 512) for value in identities))
+        if not isinstance(allowedWorkspaceRoots, list) or len(allowedWorkspaceRoots) > 128:
+            raise ValueError("allowedWorkspaceRoots must be bounded")
+        roots = [checked_string(value, "workspace root").rstrip("/") or "/" for value in allowedWorkspaceRoots]
+        clauses, scope = [], []
+        for path in roots:
+            prefix = path.rstrip("/") + "/"
+            clauses.append("(workspace=? OR substr(workspace,1,?)=?)")
+            scope.extend((path, len(prefix), prefix))
+        where = "(" + " OR ".join(clauses) + ")" if clauses else "0"
+        result = {}
+        with self.connect() as db:
+            for identity in identities:
+                rows = db.execute("SELECT uri FROM sessions WHERE engine=? AND native_id=? AND " + where + " LIMIT 2", (engineId, identity, *scope)).fetchall()
+                result[identity] = {"status": "matched", "uri": rows[0]["uri"]} if len(rows) == 1 else {"status": "ambiguous" if rows else "missing"}
+        return result
+
     def by_native(self, engine, identity, workspace, storage):
         """Adopt a host-created identity once its native files become discoverable.
 

@@ -19,6 +19,19 @@ def record(workspace, number, **extra):
     return {"uri": f"ahp-session:/{number:08d}", "engineId": "amplifier", "nativeSessionId": str(number),
             "workingDirectory": str(workspace), "modifiedAt": 1000 + number, **extra}
 
+def test_migration_lookup_is_indexed_scoped_and_never_guesses(catalog, tmp_path):
+    existing = tmp_path / 'owned'; existing.mkdir()
+    outside = tmp_path / 'outside'; outside.mkdir()
+    catalog.upsert(record(existing, 1, nativeSessionId='same'))
+    catalog.upsert(record(outside, 2, nativeSessionId='same'))
+    catalog.upsert(record(existing, 3, nativeSessionId='duplicate'))
+    catalog.upsert(record(existing, 4, nativeSessionId='duplicate'))
+    result = catalog.resolve_native(engineId='amplifier', identities=['same','duplicate','missing'], allowedWorkspaceRoots=[str(existing)])
+    assert result['same'] == {'status':'matched','uri':'ahp-session:/00000001'}
+    assert result['duplicate'] == {'status':'ambiguous'}
+    assert result['missing'] == {'status':'missing'}
+    assert catalog.resolve_native(engineId='amplifier', identities=['same'], allowedWorkspaceRoots=[])['same']['status']=='missing'
+
 
 def test_filter_is_before_page_and_children_are_explicit(catalog, tmp_path):
     existing = tmp_path / "existing"; existing.mkdir()

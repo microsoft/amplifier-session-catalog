@@ -17,7 +17,8 @@ class Server:
         self.discovery = discovery
         self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert,
                         "workspace": catalog.workspace, "recheck": catalog.recheck_workspaces,
-                        "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress}
+                        "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
+                        "resolveNative": catalog.resolve_native}
 
     def handle(self, request):
         identity = request.get("id") if isinstance(request, dict) else None

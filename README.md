@@ -58,6 +58,7 @@ authorization and passes its authorized workspace roots to list queries.
 | `scan` / `status` | Schedule/retrieve background scan; missing hints are recovered by repeated scans. No interactive list triggers a scan |
 | `recheck` | Revalidate up to `limit` oldest workspace existence facts; returns updated facts. Normally the service schedules this outside interactive request latency |
 | `workspace` | Explicit `{path,availability?}` refresh; availability values present/missing/unknown. Used for known offline sources as well as normal probes |
+| `resolveNative` | One-time migration lookup: `{engineId,identities,allowedWorkspaceRoots}` (at most 500 identities). Indexed, scoped results map IDs to `{status:"matched",uri}`, `ambiguous`, or `missing`. No filesystem scan, guessed path, or selection of one ambiguous match |
 
 Records contain `uri`, `engineId`, `nativeSessionId`, `workingDirectory`, `title`,
 `createdAt`, `modifiedAt`, `indexedAt`, `kind` (root/child/internal),
