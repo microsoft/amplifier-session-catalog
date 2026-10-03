@@ -21,7 +21,8 @@ class Server:
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
                         "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
-                        "setVisibility": catalog.set_visibility, "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use}
+                        "setVisibility": catalog.set_visibility, "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use,
+                        "retentionCandidates":catalog.retention_candidates,"descendants":catalog.descendants}
 
     def handle(self, request):
         identity = request.get("id") if isinstance(request, dict) else None

@@ -417,6 +417,49 @@ class Catalog:
             for row in rows[:100]], "truncated": len(rows) > 100,
             "coverage": "indexed-native-history", "freshness": self.progress()}
 
+    def descendants(self, *, parentUri, limit=100):
+        """Bounded indexed family facts; never a lease or live-execution claim."""
+        checked_string(parentUri, 'parentUri', 512)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('limit must be 1..100')
+        with self.connect() as db:
+            db.execute('BEGIN')
+            root=db.execute('SELECT * FROM sessions WHERE uri=?',(parentUri,)).fetchone()
+            rows=db.execute('''WITH RECURSIVE family(uri,depth,path,cycle) AS (
+                SELECT uri,1,json_array(?,uri),uri=? FROM sessions WHERE parent_uri=?
+                UNION ALL
+                SELECT s.uri,f.depth+1,json_insert(f.path,'$[#]',s.uri),
+                    EXISTS(SELECT 1 FROM json_each(f.path) WHERE value=s.uri)
+                FROM sessions s JOIN family f ON s.parent_uri=f.uri
+                WHERE f.depth<64 AND f.cycle=0 LIMIT ?
+            ) SELECT s.*,f.depth,f.cycle,
+                EXISTS(SELECT 1 FROM sessions child WHERE child.parent_uri=s.uri) AS has_children
+                FROM family f JOIN sessions s ON s.uri=f.uri''',
+                (parentUri,parentUri,parentUri,limit+1)).fetchall()
+            progress=db.execute("SELECT value FROM progress WHERE key='discovery'").fetchone()
+        freshness=json.loads(progress[0]) if progress else {'phase':'not-started'}
+        def facts(row):
+            return {'uri':row['uri'],'engineId':row['engine'],'nativeSessionId':row['native_id'],
+                    'workingDirectory':row['workspace'],'parentUri':row['parent_uri'],
+                    'observedParentUri':row['parent_uri'],'kind':row['kind'],'source':row['source'],
+                    'modifiedAt':iso(row['modified_at']),'indexedAt':iso(row['indexed_at']),
+                    'relationship':'indexed-parent'}
+        issues=[]
+        if root is None:issues.append('root-not-indexed')
+        if len(rows)>limit:issues.append('result-limit')
+        if any(row['cycle'] for row in rows):issues.append('cycle')
+        if any(row['depth']==64 and row['has_children'] for row in rows):issues.append('depth-limit')
+        result={'parentUri':parentUri,'rootKnown':root is not None,
+                'root':facts(root) if root else None,'items':[facts(row) for row in rows[:limit]],
+                'completeIndexedCoverage':not issues,'truncated':bool(set(issues)&{'result-limit','depth-limit'}),
+                'issues':issues,'excludedKinds':[],'includesHidden':True,
+                'coverage':'indexed-native-history','freshness':freshness,
+                'externalWriterCoverage':False,'nativeFilesRead':False}
+        # This token binds the exact observed index facts and this catalog process.
+        # A stable token is still not evidence that native writers are excluded.
+        result['revision']=hmac.new(self.secret,json.dumps(result,sort_keys=True).encode(),hashlib.sha256).hexdigest()
+        return result
+
     def resolve_native(self, *, engineId, identities, allowedWorkspaceRoots):
         """Bounded migration lookup; never guess an ambiguous native identity."""
         checked_string(engineId, "engineId", 200)
@@ -476,12 +519,18 @@ class Catalog:
             raise InvalidCursor("Unknown, expired or altered cursor; fetch a fresh first page") from None
 
     def list(self, *, connectionId, limit=50, cursor=None, workingDirectory=None, search=None,
-             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None, archive=None):
+             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None, archive=None,
+             modifiedBefore=None, includeTotal=False):
         checked_string(connectionId, "connectionId", 200)
         if type(limit) is not int or not 1 <= limit <= 200:
             raise ValueError("limit must be 1..200")
         if type(includeArchive) is not bool:
             raise ValueError("includeArchive must be boolean")
+        if type(includeTotal) is not bool:
+            raise ValueError("includeTotal must be boolean")
+        if modifiedBefore is not None and (type(modifiedBefore) not in (int, float)
+                or not math.isfinite(modifiedBefore) or not 0 <= modifiedBefore <= 253402300799):
+            raise ValueError("modifiedBefore must be a finite Unix timestamp")
         if archive is not None and archive not in {'active','all','archived'}:raise ValueError('archive must be active, all or archived')
         if archive is not None and includeArchive:raise ValueError('archive cannot widen missing or hidden workspace visibility')
         if workingDirectory is not None:
@@ -496,7 +545,8 @@ class Catalog:
                 raise ValueError("allowedWorkspaceRoots must be a bounded list")
             roots = sorted({checked_string(r, "workspace root").rstrip("/") or "/" for r in roots})
         query = {"connectionId": connectionId, "workspace": workingDirectory, "search": search,
-                 "parent": parentUri, "archive": includeArchive, "archiveSelector":archive, "roots": roots}
+                 "parent": parentUri, "archive": includeArchive, "archiveSelector":archive, "roots": roots,
+                 "modifiedBefore":modifiedBefore}
         scope = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
         where, args = [], []
         if includeArchive:
@@ -521,6 +571,10 @@ class Catalog:
         if search:
             where.append("(instr(lower(s.title),lower(?))>0 OR instr(lower(s.native_id),lower(?))>0)")
             args.extend((search, search))
+        if modifiedBefore is not None:
+            where.append("s.modified_at < ? AND s.created_at < ?")
+            args.extend((modifiedBefore, modifiedBefore))
+        count_where, count_args = list(where), list(args)
         if cursor:
             data = self._decode(cursor)
             if data.get("scope") != scope:
@@ -531,13 +585,37 @@ class Catalog:
         sql += " ORDER BY s.modified_at DESC,s.uri LIMIT ?"
         args.append(limit + 1)
         with self.connect() as db:
+            # An optional explicit count uses the same read snapshot as this page.
+            # Ordinary navigation never pays for counting the whole result set.
+            db.execute('BEGIN')
             rows = db.execute(sql, args).fetchall()
+            total = db.execute("SELECT count(*) FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE "
+                               + " AND ".join(count_where), count_args).fetchone()[0] if includeTotal else None
         result = {"items": [self._record(row) for row in rows[:limit]], "freshness": self.progress()}
+        if includeTotal:
+            result['total'] = total
         if len(rows) > limit:
             last = rows[limit - 1]
             result["nextCursor"] = self._cursor({"scope": scope, "modified": last["modified_at"],
                                                 "uri": last["uri"], "expires": time.time() + 3600})
         return result
+
+    def retention_candidates(self, *, connectionId, modifiedBefore, allowedWorkspaceRoots,
+                             limit=50, cursor=None, workingDirectory=None):
+        """Cold candidate metadata only. Age is never permission to remove work."""
+        if modifiedBefore is None:
+            raise ValueError('An explicit finite cutoff is required')
+        if not isinstance(allowedWorkspaceRoots, list):
+            raise ValueError('An explicit authorized workspace root list is required')
+        result = self.list(connectionId=connectionId, modifiedBefore=modifiedBefore,
+                           allowedWorkspaceRoots=allowedWorkspaceRoots, limit=limit, cursor=cursor,
+                           workingDirectory=workingDirectory, archive='all', includeTotal=True)
+        total=result.pop('total')
+        return {**result, 'cutoff':modifiedBefore, 'candidateCount':total,
+                'eligibility':'unverified', 'scope':'visible-root-metadata',
+                'requires':['current-selection', 'live-and-unknown-work', 'native-descendants',
+                            'dependent-owner-records', 'exact-reviewed-source'],
+                'nativeFilesRead':False, 'removalAuthorized':False}
 
     def progress(self, value=None):
         with self.connect() as db:

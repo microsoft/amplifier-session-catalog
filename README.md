@@ -225,3 +225,45 @@ scanner that calculated its URI before a host claim cannot insert a duplicate.
 A claimed identity cannot later be overwritten through ordinary upsert. No native
 history content is read by the claim, and missing/hidden workspace visibility stays
 independent of registration. Tests include simultaneous scanner/claim transactions.
+
+### Retention candidates and family guards
+
+`retentionCandidates({connectionId,modifiedBefore,allowedWorkspaceRoots,limit?,cursor?,workingDirectory?})`
+returns a bounded page of **candidate metadata**, never permission to remove work.
+The cutoff is an explicit finite Unix timestamp; both creation and modification
+must precede it. Existing, non-hidden, non-deleted root conversations are selected
+before pagination, including archived roots. Authorized roots are mandatory; an
+empty list returns no candidates. The maximum page size is 200. Results include
+`candidateCount`, `cutoff`, `eligibility:'unverified'`,
+`scope:'visible-root-metadata'`, `nativeFilesRead:false`, and
+`removalAuthorized:false`. The count and page share a SQLite read snapshot. A
+candidate still requires current-selection, live/unknown work, descendant,
+dependent-owner and exact-reviewed-source checks by the responsible host.
+
+`list` also accepts `modifiedBefore` and `includeTotal:false`. Counting is an
+explicit operation over the matching disk index, never part of ordinary list
+navigation. Cursor identity includes the cutoff; pages remain live rather than a
+frozen multi-request snapshot. These queries never open or stat native files.
+
+`descendants({parentUri,limit?})` is a trusted-host safety query, separate from
+visible child navigation. It follows **all** indexed parent relationships,
+including hidden, archived, deleted, internal and independent-fork records.
+It returns at most 100 descendants and traverses at most 64 levels. `root` and
+`items` contain exact URI, native/engine identity, working directory, parent URI,
+kind, source and indexed/modified timestamps. A missing root, cycle, depth limit
+or result overflow sets `completeIndexedCoverage:false` with explicit `issues`.
+It does not truncate silently into a successful guard.
+
+The returned `revision` binds the exact family facts and discovery freshness to
+this catalog process. A caller can re-query under its own admission/ownership
+locks and reject changed facts; the token is not a lease and is not valid across
+catalog restarts. `coverage:'indexed-native-history'` and
+`externalWriterCoverage:false` explicitly exclude undiscovered/noncooperating
+writers. A complete indexed result does not establish complete native coverage:
+callers must check scan freshness/issues and acquire and verify the actual native
+family ownership. No interactive guard triggers discovery or loads history.
+
+Tests cover missing roots, all relationship kinds, cycles, truncation, changed
+facts, process-local revisions and bounded SQLite work with 25,000 unrelated
+records. Retention tests separately qualify indexed counting at that scale; they
+do not claim constant-time counts or authorization to delete historical logs.
