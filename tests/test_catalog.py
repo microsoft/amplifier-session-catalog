@@ -308,3 +308,15 @@ def test_configured_native_lifecycle_markers_are_bounded_and_identity_checked(ca
     marker.write_text(json.dumps({'sessionId':'root','historyCwd':str(workspace),'deleted':False,'commandId':'native-restore'}))
     discovery.hint(str(directory));assert catalog.list(connectionId='restored')['items'][0]['uri']==uri
     assert (directory/'transcript.jsonl').exists()
+
+
+def test_first_discovery_never_exposes_native_tombstone_between_index_writes(catalog,tmp_path,monkeypatch):
+    workspace=tmp_path/'work';workspace.mkdir();home=tmp_path/'home';app=tmp_path/'app';directory=native_session(home,workspace,'removed')
+    marker=app/'sessions/removed/lifecycle.json';marker.parent.mkdir(parents=True);marker.write_text(json.dumps({'sessionId':'removed','historyCwd':str(workspace),'deleted':True,'commandId':'prior-delete'}))
+    original=catalog.upsert
+    def observed(*args,**kwargs):
+        result=original(*args,**kwargs)
+        assert catalog.list(connectionId='concurrent-reader')['items']==[]
+        return result
+    monkeypatch.setattr(catalog,'upsert',observed)
+    Discovery(catalog,[home],known_workspaces=[workspace],app_homes=[app]).hint(str(directory))

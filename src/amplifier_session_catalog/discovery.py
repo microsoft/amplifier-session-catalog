@@ -190,7 +190,7 @@ class Discovery:
                 record[key] = merged[key][:8192]
         if issues:
             record["reason"] = "; ".join(issues)[:8192]
-        self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run)
+        confirmations=[]
         for path, stamp in zip(markers, marker_stamps):
             if not stamp: continue
             try:
@@ -202,10 +202,14 @@ class Discovery:
                 marker = json.loads(raw)
                 if marker.get("sessionId") != identity or marker.get("historyCwd") != workspace:
                     raise ValueError("Lifecycle marker identity does not match native history")
-                self.catalog.set_visibility(uri=uri, nativeSessionId=identity, workingDirectory=workspace,
-                    deleted=marker["deleted"], commandId=marker["commandId"], evidence="configured-native-marker")
+                if type(marker.get("deleted")) is not bool or not isinstance(marker.get("commandId"),str) or not 1 <= len(marker["commandId"]) <= 200:
+                    raise ValueError("Invalid native lifecycle marker proof")
+                confirmations.append({"deleted":marker["deleted"], "commandId":marker["commandId"], "evidence":"configured-native-marker"})
             except (OSError, ValueError, KeyError, TypeError):
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
+        confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
+        if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
+        self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation)
         return {"uri": uri, "changed": True, "issues": issues}
 
     @staticmethod

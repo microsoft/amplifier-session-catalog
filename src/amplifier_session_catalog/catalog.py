@@ -124,7 +124,7 @@ class Catalog:
                        (path, availability, time.time()))
         return {"path": path, "availability": availability}
 
-    def upsert(self, record, *, source="host", fingerprint=None, seen_run=None):
+    def upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None):
         if not isinstance(record, dict):
             raise ValueError("record must be an object")
         uri = checked_string(record.get("uri"), "uri", 512)
@@ -156,7 +156,13 @@ class Catalog:
             known = db.execute("SELECT path FROM workspaces WHERE path=?", (workspace,)).fetchone()
         if known is None:
             self.workspace(workspace)
+        if confirmed_visibility is not None:
+            if not isinstance(confirmed_visibility, dict) or type(confirmed_visibility.get("deleted")) is not bool or confirmed_visibility.get("evidence") != "configured-native-marker":
+                raise ValueError("Verified discovery marker required for atomic visibility")
+            checked_string(confirmed_visibility.get("commandId"), "commandId", 200)
         with self.connect() as db:
+            if confirmed_visibility is not None:
+                db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
             if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
