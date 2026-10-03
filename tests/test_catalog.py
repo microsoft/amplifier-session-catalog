@@ -320,3 +320,30 @@ def test_first_discovery_never_exposes_native_tombstone_between_index_writes(cat
         return result
     monkeypatch.setattr(catalog,'upsert',observed)
     Discovery(catalog,[home],known_workspaces=[workspace],app_homes=[app]).hint(str(directory))
+
+def test_archive_selector_preserves_visible_dirs_and_root_paging(catalog,tmp_path,monkeypatch):
+    existing=tmp_path/'existing';existing.mkdir();missing=tmp_path/'missing';hidden=tmp_path/'hidden';hidden.mkdir()
+    for i in range(12):catalog.upsert(record(existing,i,isArchived=i%2==1))
+    for i in range(12,24):catalog.upsert(record(missing,i,isArchived=True))
+    for i in range(24,36):catalog.upsert(record(hidden,i,isArchived=True))
+    catalog.project_workspaces(source='owner',afterRevision=0,throughRevision=1,records=[{'id':catalog.workspace_id(str(hidden)),'path':str(hidden),'name':'Hidden','registered':False,'hidden':True,'revision':1}])
+    catalog.upsert(record(existing,36,isArchived=True,parentUri=record(existing,1)['uri']))
+    catalog.upsert(record(existing,37,isArchived=True,kind='internal'))
+    monkeypatch.setattr(Path,'stat',lambda *_a,**_k:(_ for _ in ()).throw(AssertionError('List must be indexed')))
+    for selector,expected in [('active',6),('all',12),('archived',6)]:
+        page=catalog.list(connectionId='viewer',archive=selector,limit=2);rows=list(page['items'])
+        if page.get('nextCursor'):
+            with pytest.raises(InvalidCursor):catalog.list(connectionId='viewer',archive='all' if selector!='all' else 'active',limit=2,cursor=page['nextCursor'])
+        while page.get('nextCursor'):
+            page=catalog.list(connectionId='viewer',archive=selector,limit=2,cursor=page['nextCursor']);rows+=page['items']
+        assert len(rows)==expected and all(row['workingDirectory']==str(existing) and row['kind']=='root' for row in rows)
+    assert len(catalog.list(connectionId='legacy',includeArchive=True)['items'])==36
+    with pytest.raises(ValueError):catalog.list(connectionId='viewer',includeArchive=True,archive='all')
+
+def test_native_scanner_never_clears_host_archive_projection(catalog,tmp_path):
+    path=tmp_path/'project';path.mkdir();item=record(path,1,isArchived=True);catalog.upsert(item)
+    catalog.upsert(record(path,1),source='native')
+    assert catalog.get(item['uri'])['isArchived'] is True
+    catalog.project_session_archives(items=[{'uri':item['uri'],'isArchived':False}])
+    assert catalog.get(item['uri'])['isArchived'] is False
+    with pytest.raises(ValueError):catalog.project_session_archives(items=[{'uri':item['uri'],'isArchived':True}]*101)

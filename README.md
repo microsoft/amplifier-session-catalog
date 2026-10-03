@@ -193,3 +193,17 @@ The default scanner/recheck maintenance still repairs external directory changes
 No list or get method loads native transcript/events. Schema 1's original facts
 and native records remain compatible; new workspace identity/visibility tables
 are derived, rebuilt in bounded migration batches.
+
+Archive selection is separate from workspace visibility. `list` now accepts
+`archive: 'active' | 'all' | 'archived'`; every value retains ordinary existing,
+non-hidden, non-deleted filtering before keyset pagination. It cannot be combined
+with `includeArchive:true`. Omitting it preserves the previous API behavior,
+including the historical `includeArchive` compatibility flag. Archive cursors are
+bound to the selector. Records expose `isArchived`; host `upsert` may provide an
+explicit boolean. Native scans that omit it never clear a host-owned archive flag.
+
+Trusted hosts may repair derived flags through `projectSessionArchives` with
+`{items:[{uri,isArchived}]}` (at most100). It changes only the derived archive
+projection, not native history or directories, and may precede later native
+metadata discovery. Active/archive queries use the catalog's indexed flags;
+there is no transcript scan or in-memory historical session collection.

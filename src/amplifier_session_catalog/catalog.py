@@ -95,6 +95,8 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS storage_lookup ON sessions(storage_path);
                 CREATE INDEX IF NOT EXISTS native_lookup ON sessions(engine, native_id, workspace);
                 CREATE INDEX IF NOT EXISTS source_sessions ON sessions(source, seen_run);
+                CREATE TABLE IF NOT EXISTS session_archive (uri TEXT PRIMARY KEY, archived INTEGER NOT NULL CHECK(archived IN (0,1)));
+                CREATE INDEX IF NOT EXISTS archived_sessions ON session_archive(archived,uri);
                 CREATE TABLE IF NOT EXISTS native_visibility (uri TEXT PRIMARY KEY, deleted INTEGER NOT NULL, command_id TEXT NOT NULL, evidence TEXT NOT NULL);
                 DROP TRIGGER IF EXISTS workspace_visibility;
                 CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
@@ -176,6 +178,8 @@ class Catalog:
         raw = json.dumps(details, ensure_ascii=False)
         if len(raw.encode()) > 32768:
             raise ValueError("Catalog details exceed 32 KiB")
+        archive = record.get('isArchived')
+        if 'isArchived' in record and type(archive) is not bool:raise ValueError('isArchived must be boolean')
         storage = checked_string(record.get("storagePath"), "storagePath", optional=True)
         with self.connect() as db:
             known = db.execute("SELECT path FROM workspaces WHERE path=?", (workspace,)).fetchone()
@@ -186,6 +190,8 @@ class Catalog:
                 raise ValueError("Verified discovery marker required for atomic visibility")
             checked_string(confirmed_visibility.get("commandId"), "commandId", 200)
         with self.connect() as db:
+            if archive is not None:
+                db.execute("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",(uri,int(archive)))
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
@@ -200,6 +206,16 @@ class Catalog:
                 (uri, engine, native, workspace, parent, kind, title, created, modified, availability,
                  source, storage, record.get("nativeProject"), fingerprint, seen_run, now, raw, visible))
         return self.get(uri)
+
+    def project_session_archives(self, *, items):
+        """Derived flags from the trusted host; no history reads or native metadata writes."""
+        if not isinstance(items,list) or len(items)>100:raise ValueError('Archive projection requires at most100 items')
+        values=[]
+        for item in items:
+            if not isinstance(item,dict) or set(item)!={'uri','isArchived'} or type(item['isArchived']) is not bool:raise ValueError('Exact archive projection item required')
+            values.append((checked_string(item['uri'],'uri',512),int(item['isArchived'])))
+        with self.connect() as db:db.executemany("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",values)
+        return {'projected':len(values)}
 
     def set_visibility(self, *, uri, nativeSessionId, workingDirectory, deleted, commandId, evidence):
         """Derived visibility only, after exact storage-owner confirmation. No file mutation."""
@@ -301,7 +317,7 @@ class Catalog:
                   "workingDirectory": row["workspace"], "title": row["title"], "kind": row["kind"],
                   "createdAt": iso(row["created_at"]), "modifiedAt": iso(row["modified_at"]),
                   "availability": row["availability"], "workspaceAvailability": row["workspace_availability"],
-                  "indexedAt": iso(row["indexed_at"]), "status": "idle", "nativeDeleted": bool(row["native_deleted"]) if "native_deleted" in row.keys() else False}
+                  "indexedAt": iso(row["indexed_at"]), "status": "idle", "isArchived": bool(row["is_archived"]) if "is_archived" in row.keys() else False, "nativeDeleted": bool(row["native_deleted"]) if "native_deleted" in row.keys() else False}
         if row["parent_uri"]:
             result["parentUri"] = row["parent_uri"]
         if row["storage_path"]:
@@ -312,7 +328,7 @@ class Catalog:
     def get(self, uri):
         checked_string(uri, "uri", 512)
         with self.connect() as db:
-            row = db.execute("SELECT s.*, w.availability AS workspace_availability, EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AS native_deleted FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
+            row = db.execute("SELECT s.*, COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived, w.availability AS workspace_availability, EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AS native_deleted FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
         return self._record(row)
 
     def by_storage(self, path):
@@ -402,12 +418,14 @@ class Catalog:
             raise InvalidCursor("Unknown, expired or altered cursor; fetch a fresh first page") from None
 
     def list(self, *, connectionId, limit=50, cursor=None, workingDirectory=None, search=None,
-             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None):
+             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None, archive=None):
         checked_string(connectionId, "connectionId", 200)
         if type(limit) is not int or not 1 <= limit <= 200:
             raise ValueError("limit must be 1..200")
         if type(includeArchive) is not bool:
             raise ValueError("includeArchive must be boolean")
+        if archive is not None and archive not in {'active','all','archived'}:raise ValueError('archive must be active, all or archived')
+        if archive is not None and includeArchive:raise ValueError('archive cannot widen missing or hidden workspace visibility')
         if workingDirectory is not None:
             checked_string(workingDirectory, "workingDirectory")
         if parentUri is not None:
@@ -420,13 +438,15 @@ class Catalog:
                 raise ValueError("allowedWorkspaceRoots must be a bounded list")
             roots = sorted({checked_string(r, "workspace root").rstrip("/") or "/" for r in roots})
         query = {"connectionId": connectionId, "workspace": workingDirectory, "search": search,
-                 "parent": parentUri, "archive": includeArchive, "roots": roots}
+                 "parent": parentUri, "archive": includeArchive, "archiveSelector":archive, "roots": roots}
         scope = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
         where, args = [], []
         if includeArchive:
             where.append("NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1)")
         if not includeArchive:
             where.append("s.visible=1")
+        if archive in {'active','archived'}:
+            where.append("s.uri "+("IN" if archive=="archived" else "NOT IN")+" (SELECT uri FROM session_archive WHERE archived=1)")
         if parentUri:
             where.append("s.parent_uri=? AND s.kind='child'"); args.append(parentUri)
         else:
@@ -449,7 +469,7 @@ class Catalog:
                 raise InvalidCursor("Cursor belongs to another connection or query")
             where.append("(s.modified_at < ? OR (s.modified_at=? AND s.uri>?))")
             args.extend((data["modified"], data["modified"], data["uri"]))
-        sql = "SELECT s.*,w.availability AS workspace_availability FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE " + " AND ".join(where)
+        sql = "SELECT s.*,COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived,w.availability AS workspace_availability FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE " + " AND ".join(where)
         sql += " ORDER BY s.modified_at DESC,s.uri LIMIT ?"
         args.append(limit + 1)
         with self.connect() as db:
