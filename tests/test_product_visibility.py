@@ -115,6 +115,11 @@ def test_filtered_child_archive_retention_pages_and_guards(tmp_path):
     for kwargs in ({},{'archive':'all'},{'includeArchive':True}):
         page=catalog.list(connectionId='a',limit=5,**kwargs)
         assert len(page['items'])==5 and page['items'][0]['nativeSessionId']=='19'
+        rows=list(page['items'])
+        while page.get('nextCursor'):
+            page=catalog.list(connectionId='a',limit=5,cursor=page['nextCursor'],**kwargs)
+            rows.extend(page['items'])
+        assert [int(row['nativeSessionId']) for row in rows]==list(range(19,2,-1))+[1]
     assert not catalog.list(connectionId='a',parentUri=root['uri'])['items']
     assert catalog.descendants(parentUri=root['uri'])['items'][0]['uri']==child['uri']
     result=catalog.retention_candidates(connectionId='a',modifiedBefore=10000,allowedWorkspaceRoots=[str(tmp_path)])
@@ -156,3 +161,25 @@ def test_stdio_methods_are_additive_and_passive(tmp_path):
     expected=server.handle(request)['result']
     assert server.handle({'jsonrpc':'2.0','id':2,'method':'sessionVisibilityProjectionReceipt','params':{'source':'host','commandId':'reset'}})['result']==expected
     assert server.handle({'jsonrpc':'2.0','id':3,'method':'sessionVisibilityProjectionStatus','params':{'source':'host'}})['result']['revision']==1
+
+
+def test_catalog_loss_replays_host_snapshot_in_contiguous_bounded_batches(tmp_path):
+    catalog=Catalog(tmp_path/'old.sqlite')
+    rows=[record(tmp_path,i) for i in range(105)]
+    for row in rows:catalog.upsert(row)
+    project(catalog,[(row['uri'],True) for row in rows[:100]])
+    project(catalog,[(row['uri'],True) for row in rows[100:]],after=1,through=2,command='reset-page2')
+    # Actual host fence is deliberately outside this component; emulate its order.
+    snapshot=[(row['uri'],catalog.get(row['uri'])['productHidden']) for row in rows]
+    rebuilt=Catalog(tmp_path/'rebuilt.sqlite')
+    assert rebuilt.session_visibility_projection_status(source='host')['revision']==0
+    for row in rows:rebuilt.upsert(row)
+    for page in range(2):
+        batch=snapshot[page*100:(page+1)*100]
+        result=project(rebuilt,batch,after=page,through=page+1,command=f'rebuild-epoch-page{page}')
+        assert result['projected']==len(batch)
+        assert rebuilt.session_visibility_projection_status(source='host')['revision']==page+1
+    assert rebuilt.list(connectionId='product-ready')['items']==[]
+    # No-row snapshots still have an explicit verifiable completion checkpoint.
+    receipt=project(rebuilt,[],after=2,through=3,command='rebuild-empty-final')
+    assert receipt['projected']==0 and receipt['revision']==3
