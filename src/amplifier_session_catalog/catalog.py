@@ -73,6 +73,13 @@ class Catalog:
                     path TEXT PRIMARY KEY, availability TEXT NOT NULL, checked_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS workspace_availability ON workspaces(availability, path);
+                CREATE TABLE IF NOT EXISTS workspace_index (
+                    path TEXT PRIMARY KEY,id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,sort_name TEXT NOT NULL,
+                    availability TEXT NOT NULL,registered INTEGER NOT NULL DEFAULT 0,hidden INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0,source TEXT
+                );
+                CREATE INDEX IF NOT EXISTS available_workspace_order ON workspace_index(availability,hidden,sort_name,path);
+                CREATE TABLE IF NOT EXISTS workspace_projection (source TEXT PRIMARY KEY,revision INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS sessions (
                     uri TEXT PRIMARY KEY, engine TEXT NOT NULL, native_id TEXT NOT NULL,
                     workspace TEXT NOT NULL, parent_uri TEXT, kind TEXT NOT NULL,
@@ -92,11 +99,19 @@ class Catalog:
                 DROP TRIGGER IF EXISTS workspace_visibility;
                 CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
                     WHEN OLD.availability <> NEW.availability BEGIN
-                    UPDATE sessions SET visible=(NEW.availability='present' AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
+                    UPDATE workspace_index SET availability=NEW.availability WHERE path=NEW.path;
+                    UPDATE sessions SET visible=(NEW.availability='present' AND NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
                 END;
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
             """)
+        # Repair only derived workspace identity metadata, in bounded migration batches.
+        while True:
+            with self.connect() as db:
+                rows=db.execute("SELECT path,availability FROM workspaces WHERE NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspaces.path) LIMIT 100").fetchall()
+                for row in rows:
+                    self._workspace_index(db,row['path'],row['availability'])
+            if len(rows)<100:break
         os.chmod(self.path, 0o600)
 
     @contextmanager
@@ -112,6 +127,15 @@ class Catalog:
         finally:
             db.close()
 
+    @staticmethod
+    def workspace_id(path):
+        return "workspace:"+hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _workspace_index(cls,db,path,availability):
+        name=Path(path).name or path
+        db.execute("INSERT INTO workspace_index(path,id,name,sort_name,availability) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability",(path,cls.workspace_id(path),name,name.casefold(),availability))
+
     def workspace(self, path, *, availability=None):
         path = checked_string(path, "workingDirectory")
         if not Path(path).is_absolute():
@@ -122,6 +146,7 @@ class Catalog:
         with self.connect() as db:
             db.execute("INSERT INTO workspaces VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability, checked_at=excluded.checked_at",
                        (path, availability, time.time()))
+            self._workspace_index(db,path,availability)
         return {"path": path, "availability": availability}
 
     def upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None):
@@ -164,7 +189,7 @@ class Catalog:
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
-            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone(): visible = 0
+            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,native_id=excluded.native_id,
                 workspace=excluded.workspace,parent_uri=excluded.parent_uri,kind=excluded.kind,
@@ -188,8 +213,85 @@ class Catalog:
             raise ValueError("Confirmed native visibility evidence required")
         with self.connect() as db:
             db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(deleted), commandId, evidence))
-            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present')) WHERE uri=?", (int(deleted), uri))
+            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1)) WHERE uri=?", (int(deleted), uri))
         return {"uri": uri, "deleted": deleted, "commandId": commandId}
+
+    @staticmethod
+    def _workspace_record(row):
+        return {"id":row["id"],"path":row["path"],"name":row["name"],"available":row["availability"]=="present",
+                "availability":row["availability"],"registered":bool(row["registered"]),"hidden":bool(row["hidden"]),
+                "revision":row["revision"],"source":"registered" if row["source"] else "discovered","checkedAt":iso(row["checked_at"])}
+
+    def get_workspace(self, *, id):
+        checked_string(id,"workspace ID",128)
+        with self.connect() as db:
+            row=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE wi.id=?",(id,)).fetchone()
+        return self._workspace_record(row) if row else None
+
+    def list_workspaces(self, *, connectionId, limit=50, cursor=None, search=None, includeHidden=False, includeUnavailable=False, allowedWorkspaceRoots=None):
+        checked_string(connectionId,"connectionId",200)
+        if type(limit) is not int or not 1<=limit<=200:raise ValueError("limit must be1..200")
+        if type(includeHidden) is not bool or type(includeUnavailable) is not bool:raise ValueError("Workspace visibility flags must be boolean")
+        if search is not None:checked_string(search,"search",500)
+        roots=allowedWorkspaceRoots
+        if roots is not None:
+            if not isinstance(roots,list) or len(roots)>128:raise ValueError("Bounded authorized workspace roots required")
+            roots=sorted({checked_string(root,"root").rstrip('/') or '/' for root in roots})
+        scope=hashlib.sha256(json.dumps(["workspaces",connectionId,search,includeHidden,includeUnavailable,roots],sort_keys=True).encode()).hexdigest()
+        where,args=[],[]
+        if not includeHidden:where.append("wi.hidden=0")
+        if not includeUnavailable:where.append("wi.availability='present'")
+        if search:
+            where.append("(instr(lower(wi.name),lower(?))>0 OR instr(lower(wi.path),lower(?))>0)");args.extend([search,search])
+        if roots is not None:
+            parts=[]
+            for root in roots:
+                prefix=root.rstrip('/')+'/'
+                parts.append("(wi.path=? OR substr(wi.path,1,?)=?)");args.extend([root,len(prefix),prefix])
+            where.append('('+' OR '.join(parts)+')' if parts else '0')
+        if cursor:
+            decoded=self._decode(cursor)
+            if decoded.get('scope')!=scope:raise InvalidCursor("Workspace cursor belongs to another connection or query")
+            where.append("(wi.sort_name,wi.path)>(?,?)");args.extend([decoded['name'],decoded['path']])
+        with self.connect() as db:
+            rows=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE "+(' AND '.join(where) or '1')+" ORDER BY wi.sort_name,wi.path LIMIT ?",[*args,limit+1]).fetchall()
+        result={"items":[self._workspace_record(row) for row in rows[:limit]],"freshness":self.progress()}
+        if len(rows)>limit:
+            row=rows[limit-1];result['nextCursor']=self._cursor({'scope':scope,'name':row['sort_name'],'path':row['path'],'expires':time.time()+3600})
+        return result
+
+    def workspace_projection_status(self, *, source):
+        checked_string(source,"workspace owner",200)
+        with self.connect() as db:row=db.execute("SELECT revision FROM workspace_projection WHERE source=?",(source,)).fetchone()
+        return {"source":source,"revision":row[0] if row else 0}
+
+    def project_workspaces(self, *, source, afterRevision, throughRevision, records):
+        """Trusted owner's bounded derived projection, never canonical workspace storage."""
+        checked_string(source,"workspace owner",200)
+        if type(afterRevision) is not int or type(throughRevision) is not int or not 0<=afterRevision<=throughRevision:raise ValueError("Monotonic projection revisions required")
+        if not isinstance(records,list) or len(records)>100:raise ValueError("Workspace projection batch exceeds100")
+        values=[]
+        for row in records:
+            if not isinstance(row,dict):raise ValueError("Workspace projection record required")
+            path=checked_string(row.get('path'),'path');name=checked_string(row.get('name'),'name',200);revision=row.get('revision')
+            if not Path(path).is_absolute() or os.path.normpath(path)!=path or row.get('id')!=self.workspace_id(path):raise ValueError("Canonical workspace identity required")
+            if type(revision) is not int or not afterRevision<revision<=throughRevision:raise ValueError("Projection record outside batch revision")
+            if type(row.get('registered')) is not bool or type(row.get('hidden')) is not bool:raise ValueError("Workspace projection flags required")
+            values.append((row,path,name,revision))
+        with self.connect() as db:
+            old=db.execute("SELECT revision FROM workspace_projection WHERE source=?",(source,)).fetchone();current=old[0] if old else 0
+            if current!=afterRevision:raise InvalidCursor("Workspace projection changed; inspect its checkpoint")
+            for row,path,name,revision in values:
+                known=db.execute("SELECT source,hidden FROM workspace_index WHERE path=?",(path,)).fetchone()
+                if known and known['source'] not in (None,source):raise ValueError("Workspace projection belongs to a different configured owner")
+                # Existence is refreshed only for changed registrations, not ordinary queries.
+                availability=directory_status(path)
+                db.execute("INSERT INTO workspaces VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability,checked_at=excluded.checked_at",(path,availability,time.time()))
+                db.execute("INSERT INTO workspace_index VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,availability=excluded.availability,registered=excluded.registered,hidden=excluded.hidden,revision=excluded.revision,source=excluded.source",(path,row['id'],name,name.casefold(),availability,int(row['registered']),int(row['hidden']),revision,source))
+                if bool(known['hidden'] if known else False)!=row['hidden']:
+                    db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
+            db.execute("INSERT INTO workspace_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision",(source,throughRevision))
+        return {"source":source,"revision":throughRevision,"projected":len(records)}
 
     @staticmethod
     def _record(row):

@@ -163,3 +163,33 @@ opened by hint processing (transcript stat remains part of change detection).
 The legacy CLI opt-in is `AMPLIFIER_SESSION_CATALOG_HINT_DIRECTORY`, pointing to the
 same directory. Native ACP notifications continue using the live `hint` RPC; neither
 path requires or introduces a different canonical-history format.
+
+### Workspace metadata and registration projection
+
+The catalog also exposes existing-directory workspace discovery without reading
+native history or scanning the filesystem per query:
+
+- `listWorkspaces({connectionId,limit<=200,cursor?,search?,includeHidden:false,includeUnavailable:false,allowedWorkspaceRoots?})`
+  returns `{items,nextCursor?,freshness}`. Visibility/root/search filtering occurs
+  before keyset pagination, ordered by folded display name and canonical path.
+  Cursors bind the connection and exact query. DTOs include
+  `{id,name,path,available,availability,registered,hidden,revision,source,checkedAt}`.
+- `getWorkspace({id})` performs an exact indexed read, including unavailable or
+  hidden entries. Access authorization belongs to the caller.
+- `workspaceProjectionStatus({source})` returns an owner's applied revision.
+- `projectWorkspaces({source,afterRevision,throughRevision,records})` applies at
+  most 100 changed registration records and its checkpoint atomically. Records
+  are `{id,path,name,registered,hidden,revision}`; ID is `workspace:` plus SHA256
+  of the canonical path. Revision must fall inside the checkpoint interval. A
+  conflicting owner or checkpoint is rejected. Only changed records refresh
+  directory availability; label-only updates do not rewrite all session rows.
+
+A separately configured registration owner retains canonical receipts and can
+rebuild this projection after catalog loss. This service does not create, rename,
+move, or delete workspace directories. A hidden registration suppresses default
+workspace and session discovery, including after scanner/native updates. Explicit
+owner attachment restores it; archive/exact reads preserve historical access.
+The default scanner/recheck maintenance still repairs external directory changes.
+No list or get method loads native transcript/events. Schema 1's original facts
+and native records remain compatible; new workspace identity/visibility tables
+are derived, rebuilt in bounded migration batches.
