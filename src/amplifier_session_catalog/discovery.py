@@ -119,7 +119,9 @@ class Discovery:
         transcript = file_stamp(directory / "transcript.jsonl") or file_stamp(directory / "transcript.jsonl.backup")
         markers = [(root / "sessions" / identity / "lifecycle.json") for root in self.app_homes]
         marker_stamps = [file_stamp(path) for path in markers]
-        fingerprint = hashlib.sha256(json.dumps([stamps, transcript, marker_stamps]).encode()).hexdigest()
+        # A derived-index upgrade must rebuild native parent evidence even when
+        # canonical file stamps have not changed since the prior scanner version.
+        fingerprint = hashlib.sha256(json.dumps(['native-parent-v1',stamps, transcript, marker_stamps]).encode()).hexdigest()
         if previous and previous["fingerprint"] == fingerprint and not force:
             if run:
                 self.catalog.touch_seen(previous["uri"], run)
@@ -233,7 +235,8 @@ class Discovery:
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
-        self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation)
+        self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
+                            native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
         return {"uri": uri, "changed": True, "issues": issues}
 
     @staticmethod

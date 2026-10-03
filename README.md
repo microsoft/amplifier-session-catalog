@@ -297,3 +297,14 @@ identities. Conflicting prior mappings require explicit owner repair. An existin
 host projection survives missing, malformed, or stale scanner location metadata.
 The native owner must verify its durable creation record before activation;
 metadata alone is not that proof.
+
+Native parent links retain the exact engine/native identity, canonical workspace,
+and native parent storage path in a separate derived index. Child-first discovery,
+later managed-root discovery, and concurrent host/import mappings repair those
+links in the same writer transaction without changing child titles or archive
+flags. Ambiguous parents make `descendants.completeIndexedCoverage` false.
+Upgrading discovery refreshes old fingerprints once from bounded metadata; it
+never reads transcript or event bodies for this repair. `discoveryComplete` is
+separate from graph/index completeness and is true only for a completed scan
+without issues. Callers must also check freshness; neither field excludes an
+external writer or proves a current native family lease.

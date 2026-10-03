@@ -141,6 +141,8 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS parent_order ON sessions(parent_uri, modified_at DESC, uri);
                 CREATE INDEX IF NOT EXISTS storage_lookup ON sessions(storage_path);
                 CREATE INDEX IF NOT EXISTS native_lookup ON sessions(engine, native_id, workspace);
+                CREATE TABLE IF NOT EXISTS native_parent_links(uri TEXT PRIMARY KEY,engine TEXT NOT NULL,parent_native_id TEXT NOT NULL,workspace TEXT NOT NULL,parent_storage TEXT NOT NULL,fallback_uri TEXT NOT NULL,state TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS native_parent_identity ON native_parent_links(engine,parent_native_id,workspace);
                 CREATE TABLE IF NOT EXISTS native_claims(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,engine TEXT NOT NULL,native_id TEXT NOT NULL,workspace TEXT NOT NULL,uri TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS native_claim_identity ON native_claims(engine,native_id,workspace);
                 CREATE INDEX IF NOT EXISTS source_sessions ON sessions(source, seen_run);
@@ -203,7 +205,23 @@ class Catalog:
             self._workspace_index(db,path,availability)
         return {"path": path, "availability": availability}
 
-    def upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None):
+    @staticmethod
+    def _resolve_native_parents(db, engine, native, workspace):
+        # Discovery order and host/import mapping races must not determine family
+        # membership. Resolve only this indexed native identity, never all rows.
+        after=''
+        while True:
+            links=db.execute('SELECT * FROM native_parent_links WHERE engine=? AND parent_native_id=? AND workspace=? AND uri>? ORDER BY uri LIMIT 100',(engine,native,workspace,after)).fetchall()
+            for link in links:
+                rows=db.execute('SELECT uri FROM sessions WHERE engine=? AND native_id=? AND workspace=? AND (storage_path=? OR storage_path IS NULL) LIMIT 2',(engine,native,workspace,link['parent_storage'])).fetchall()
+                state='resolved' if len(rows)==1 else 'ambiguous' if rows else 'missing'
+                parent=rows[0]['uri'] if len(rows)==1 else link['fallback_uri']
+                db.execute('UPDATE sessions SET parent_uri=? WHERE uri=?',(parent,link['uri']))
+                db.execute('UPDATE native_parent_links SET state=? WHERE uri=?',(state,link['uri']))
+            if len(links)<100:break
+            after=links[-1]['uri']
+
+    def upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None, native_parent=None):
         if not isinstance(record, dict):
             raise ValueError("record must be an object")
         uri = checked_string(record.get("uri"), "uri", 512)
@@ -235,6 +253,15 @@ class Catalog:
         archive = record.get('isArchived')
         if 'isArchived' in record and type(archive) is not bool:raise ValueError('isArchived must be boolean')
         storage = checked_string(record.get("storagePath"), "storagePath", optional=True)
+        if native_parent is not None:
+            if source=='host' or not isinstance(native_parent,dict) or set(native_parent)!={'nativeId','storagePath'} or not parent:
+                raise ValueError('Discovery-owned exact native parent identity required')
+            checked_string(native_parent['nativeId'],'native parent identity',512)
+            checked_string(native_parent['storagePath'],'native parent storage')
+            if native_parent['nativeId'] in {'.','..'} or any(char in native_parent['nativeId'] for char in '/\\'):
+                raise ValueError('Native parent must be one exact storage identity')
+            if not storage or Path(storage).parent/native_parent['nativeId']!=Path(native_parent['storagePath']):
+                raise ValueError('Native parent storage differs from selected project')
         with self.connect() as db:
             known = db.execute("SELECT path FROM workspaces WHERE path=?", (workspace,)).fetchone()
         if known is None:
@@ -296,6 +323,13 @@ class Catalog:
                 seen_run=excluded.seen_run,indexed_at=excluded.indexed_at,details=excluded.details,visible=excluded.visible""",
                 (uri, engine, native, workspace, parent, kind, title, created, modified, availability,
                  source, storage, record.get("nativeProject"), fingerprint, seen_run, now, raw, visible))
+            if native_parent:
+                db.execute('INSERT INTO native_parent_links VALUES(?,?,?,?,?,?,?) ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,parent_native_id=excluded.parent_native_id,workspace=excluded.workspace,parent_storage=excluded.parent_storage,fallback_uri=excluded.fallback_uri,state=excluded.state',
+                           (uri,engine,native_parent['nativeId'],workspace,native_parent['storagePath'],parent,'missing'))
+                self._resolve_native_parents(db,engine,native_parent['nativeId'],workspace)
+            elif source!='host':
+                db.execute('DELETE FROM native_parent_links WHERE uri=?',(uri,))
+            self._resolve_native_parents(db,engine,native,workspace)
         return self.get(uri)
 
     def claim_native(self, *, record, commandId, evidence):
@@ -334,6 +368,7 @@ class Catalog:
                     visible=db.execute("SELECT availability='present' AND NOT EXISTS(SELECT 1 FROM workspace_index WHERE path=? AND hidden=1) FROM workspaces WHERE path=?",(workspace,workspace)).fetchone()[0]
                     db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uri,engine,native,workspace,None,'root',title,created,modified,'available','host',None,None,None,None,now,'{}',visible))
                 db.execute('INSERT INTO native_claims VALUES(?,?,?,?,?,?)',(command,signature,engine,native,workspace,result_uri))
+            self._resolve_native_parents(db,engine,native,workspace)
         return self.get(result_uri)
 
     def project_session_archives(self, *, items):
@@ -509,6 +544,9 @@ class Catalog:
                 FROM family f JOIN sessions s ON s.uri=f.uri''',
                 (parentUri,parentUri,parentUri,limit+1)).fetchall()
             progress=db.execute("SELECT value FROM progress WHERE key='discovery'").fetchone()
+            identities=[root['native_id']] if root else []
+            identities.extend(row['native_id'] for row in rows[:limit])
+            unresolved=bool(root and db.execute('SELECT 1 FROM native_parent_links WHERE engine=? AND workspace=? AND state!=\'resolved\' AND parent_native_id IN ('+','.join('?' for _ in identities)+') LIMIT 1',(root['engine'],root['workspace'],*identities)).fetchone())
         freshness=json.loads(progress[0]) if progress else {'phase':'not-started'}
         def facts(row):
             return {'uri':row['uri'],'engineId':row['engine'],'nativeSessionId':row['native_id'],
@@ -518,6 +556,7 @@ class Catalog:
                     'relationship':'indexed-parent'}
         issues=[]
         if root is None:issues.append('root-not-indexed')
+        if unresolved:issues.append('native-parent-unresolved')
         if len(rows)>limit:issues.append('result-limit')
         if any(row['cycle'] for row in rows):issues.append('cycle')
         if any(row['depth']==64 and row['has_children'] for row in rows):issues.append('depth-limit')
@@ -527,6 +566,7 @@ class Catalog:
                 'issues':issues,'excludedKinds':[],'includesHidden':True,
                 'coverage':'indexed-native-history','freshness':freshness,
                 'externalWriterCoverage':False,'nativeFilesRead':False}
+        result['discoveryComplete']=freshness.get('phase')=='complete' and freshness.get('issues')==0
         # This token binds the exact observed index facts and this catalog process.
         # A stable token is still not evidence that native writers are excluded.
         result['revision']=hmac.new(self.secret,json.dumps(result,sort_keys=True).encode(),hashlib.sha256).hexdigest()
