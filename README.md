@@ -207,3 +207,21 @@ Trusted hosts may repair derived flags through `projectSessionArchives` with
 projection, not native history or directories, and may precede later native
 metadata discovery. Active/archive queries use the catalog's indexed flags;
 there is no transcript scan or in-memory historical session collection.
+
+### Atomic imported native registration
+
+`claimNative {record,commandId,evidence:'verified-native-import'}` is a trusted
+host projection API. The host must independently verify the configured native
+owner's creation receipt first; the catalog does not accept or manufacture native
+authority. The requested URI is a hint until the transaction commits. One
+unambiguous existing engine/native/workspace identity is reused, preserving title,
+archive flags and other user edits. Conflicting URIs or ambiguous native homes
+refuse. Exact command retries return the same derived mapping; changed identity
+on a command is rejected. Receipts are repairable index metadata, not transcript
+or native creation journals.
+
+Discovery rechecks native identity under the same SQLite writer transaction, so a
+scanner that calculated its URI before a host claim cannot insert a duplicate.
+A claimed identity cannot later be overwritten through ordinary upsert. No native
+history content is read by the claim, and missing/hidden workspace visibility stays
+independent of registration. Tests include simultaneous scanner/claim transactions.

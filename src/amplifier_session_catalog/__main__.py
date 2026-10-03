@@ -17,7 +17,7 @@ class Server:
     def __init__(self, catalog, discovery):
         self.catalog = catalog
         self.discovery = discovery
-        self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert,
+        self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
                         "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,

@@ -94,6 +94,8 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS parent_order ON sessions(parent_uri, modified_at DESC, uri);
                 CREATE INDEX IF NOT EXISTS storage_lookup ON sessions(storage_path);
                 CREATE INDEX IF NOT EXISTS native_lookup ON sessions(engine, native_id, workspace);
+                CREATE TABLE IF NOT EXISTS native_claims(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,engine TEXT NOT NULL,native_id TEXT NOT NULL,workspace TEXT NOT NULL,uri TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS native_claim_identity ON native_claims(engine,native_id,workspace);
                 CREATE INDEX IF NOT EXISTS source_sessions ON sessions(source, seen_run);
                 CREATE TABLE IF NOT EXISTS session_archive (uri TEXT PRIMARY KEY, archived INTEGER NOT NULL CHECK(archived IN (0,1)));
                 CREATE INDEX IF NOT EXISTS archived_sessions ON session_archive(archived,uri);
@@ -190,6 +192,24 @@ class Catalog:
                 raise ValueError("Verified discovery marker required for atomic visibility")
             checked_string(confirmed_visibility.get("commandId"), "commandId", 200)
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            reserved=db.execute('SELECT engine,native_id,workspace FROM native_claims WHERE uri=? LIMIT 1',(uri,)).fetchone()
+            if reserved and (reserved['engine'],reserved['native_id'],reserved['workspace'])!=(engine,native,workspace):raise ValueError('Claimed AHP identity cannot be overwritten')
+            if source=='host':
+                claimed=db.execute('SELECT DISTINCT uri FROM native_claims WHERE engine=? AND native_id=? AND workspace=? LIMIT 2',(engine,native,workspace)).fetchall()
+                if claimed and (len(claimed)!=1 or claimed[0]['uri']!=uri):raise ValueError('Claimed native identity cannot have another AHP mapping')
+            if source != 'host':
+                # Discovery's earlier by_native lookup is only a hint. Recheck
+                # under the writer transaction so a simultaneous host claim
+                # cannot produce a second catalog row for the same source.
+                matches = db.execute('SELECT * FROM sessions WHERE engine=? AND native_id=? AND workspace=? AND (storage_path IS NULL OR storage_path=?) LIMIT 2', (engine,native,workspace,storage)).fetchall()
+                claims = db.execute('SELECT DISTINCT uri FROM native_claims WHERE engine=? AND native_id=? AND workspace=? LIMIT 2', (engine,native,workspace)).fetchall()
+                if len(matches)>1 or len(claims)>1: raise ValueError('Native discovery identity is ambiguous')
+                if claims and (not matches or matches[0]['uri'] != claims[0]['uri']): raise ValueError('Native discovery differs from the claimed source identity')
+                if matches:
+                    known_row=matches[0];uri=known_row['uri']
+                    if claims:
+                        title=known_row['title'];created=known_row['created_at']
             if archive is not None:
                 db.execute("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",(uri,int(archive)))
             if confirmed_visibility is not None:
@@ -206,6 +226,44 @@ class Catalog:
                 (uri, engine, native, workspace, parent, kind, title, created, modified, availability,
                  source, storage, record.get("nativeProject"), fingerprint, seen_run, now, raw, visible))
         return self.get(uri)
+
+    def claim_native(self, *, record, commandId, evidence):
+        """Atomic derived registration after the host verifies native authority.
+
+        The claim is repairable metadata, never authority to create native files.
+        Reuse one existing identity without overwriting title/archive/user edits.
+        """
+        if evidence != 'verified-native-import' or not isinstance(record,dict): raise ValueError('Verified native import claim required')
+        command=checked_string(commandId,'commandId',200)
+        uri=checked_string(record.get('uri'),'uri',512)
+        if not uri.startswith('ahp-session:/'): raise ValueError('AHP URI required')
+        engine=checked_string(record.get('engineId'),'engineId',128);native=checked_string(record.get('nativeSessionId'),'nativeSessionId',512)
+        workspace=checked_string(record.get('workingDirectory'),'workingDirectory')
+        if not Path(workspace).is_absolute() or os.path.normpath(workspace)!=workspace: raise ValueError('Canonical absolute workspace required')
+        title=checked_string(record.get('title'),'title',8192)
+        signature=json.dumps([uri,engine,native,workspace],separators=(',',':'))
+        with self.connect() as db: known=db.execute('SELECT 1 FROM workspaces WHERE path=?',(workspace,)).fetchone()
+        if not known:self.workspace(workspace)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            prior=db.execute('SELECT * FROM native_claims WHERE command_id=?',(command,)).fetchone()
+            if prior:
+                if prior['signature']!=signature:raise ValueError('Claim command identity changed')
+                result_uri=prior['uri']
+                selected=db.execute('SELECT * FROM sessions WHERE uri=?',(result_uri,)).fetchone()
+                if not selected or (selected['engine'],selected['native_id'],selected['workspace'])!=(engine,native,workspace):raise ValueError('Claimed native mapping is unavailable or changed')
+            else:
+                target=db.execute('SELECT * FROM sessions WHERE uri=?',(uri,)).fetchone()
+                if target and (target['engine'],target['native_id'],target['workspace'])!=(engine,native,workspace):raise ValueError('Requested AHP URI belongs to another native identity')
+                rows=db.execute('SELECT * FROM sessions WHERE engine=? AND native_id=? AND workspace=? LIMIT 2',(engine,native,workspace)).fetchall()
+                if len(rows)>1:raise ValueError('Native claim identity is ambiguous')
+                result_uri=rows[0]['uri'] if rows else uri
+                if not rows:
+                    now=time.time();modified=timestamp(record.get('modifiedAt'),now);created=timestamp(record.get('createdAt'),modified)
+                    visible=db.execute("SELECT availability='present' AND NOT EXISTS(SELECT 1 FROM workspace_index WHERE path=? AND hidden=1) FROM workspaces WHERE path=?",(workspace,workspace)).fetchone()[0]
+                    db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uri,engine,native,workspace,None,'root',title,created,modified,'available','host',None,None,None,None,now,'{}',visible))
+                db.execute('INSERT INTO native_claims VALUES(?,?,?,?,?,?)',(command,signature,engine,native,workspace,result_uri))
+        return self.get(result_uri)
 
     def project_session_archives(self, *, items):
         """Derived flags from the trusted host; no history reads or native metadata writes."""
