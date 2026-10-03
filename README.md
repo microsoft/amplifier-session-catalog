@@ -51,7 +51,7 @@ authorization and passes its authorized workspace roots to list queries.
 
 | Method | Result / semantics |
 | --- | --- |
-| `list` | `{items, nextCursor?, freshness}`; params `connectionId` required, `limit` 1–200/default50, `cursor?`, `workingDirectory?`, `search?`, `parentUri?`, `includeArchive?` false, `allowedWorkspaceRoots?` |
+| `list` | `{items, nextCursor?, freshness}`; params `connectionId` required, `limit` 1–200/default50, `cursor?`, `workingDirectory?`, `search?`, `parentUri?`, `includeArchive?` false, `allowedWorkspaceRoots?`, `allowedManagedRoots?` |
 | `get` | One record or null, no source reads; caller must authorize its workspace before returning it |
 | `upsert` | The current indexed record; no native file mutation. A host should use the discovered URI when adopting a discovered record |
 | `hint` | Read current small metadata at the allowed native location; returns `{uri?,changed,issues?}`. Hints contain locations, not trusted replacement metadata |
@@ -267,3 +267,33 @@ Tests cover missing roots, all relationship kinds, cycles, truncation, changed
 facts, process-local revisions and bounded SQLite work with 25,000 unrelated
 records. Retention tests separately qualify indexed counting at that scale; they
 do not claim constant-time counts or authorization to delete historical logs.
+
+### Managed chat locations
+
+A host-verified managed chat projects a bounded `location` object with exactly
+`{version:1,kind:'managed',allocationId,creationReceipt,allocationHash,owner:'amplifier-unified'}`.
+The allocation ID is a canonical UUID, the hash is lowercase SHA256, and the
+receipt is a bounded command ID. The working directory must be exactly
+`<managed-root>/chats/<allocationId>/files`. This remains derived metadata;
+the catalog never grants creation, activation, or deletion authority.
+
+`list`, `retentionCandidates`, and `resolveNative` accept a separate trusted
+`allowedManagedRoots` list (at most 128 normalized absolute paths). They authorize
+only validated managed rows at those exact roots. They do not grant browsing or
+access to arbitrary sessions under the same directories. Supply an explicit
+`allowedWorkspaceRoots` list, possibly empty, alongside a managed grant. Cursor
+scope binds both lists. Ordinary queries still use only the SQLite index.
+
+Managed chats appear in the global root conversation list while their directories
+exist; their allocation directories never appear in `listWorkspaces` or
+`getWorkspace`, including requests for hidden workspaces. Registering an allocation
+as a project is refused. Archive and native visibility markers still apply.
+
+Discovery accepts location only from canonical native metadata (or its backup),
+never naming or context-intelligence sidecars. Empty managed roots can therefore
+be rediscovered before a first prompt. For roots, allocation and native IDs must
+match; their derived AHP URI uses that same UUID, avoiding scanner-first duplicate
+identities. Conflicting prior mappings require explicit owner repair. An existing
+host projection survives missing, malformed, or stale scanner location metadata.
+The native owner must verify its durable creation record before activation;
+metadata alone is not that proof.

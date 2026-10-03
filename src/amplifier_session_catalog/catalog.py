@@ -14,6 +14,8 @@ import secrets
 import sqlite3
 import stat
 import time
+import uuid
+import re
 
 
 class InvalidCursor(ValueError):
@@ -54,6 +56,51 @@ def checked_string(value, field, limit=8192, optional=False):
     if not isinstance(value, str) or not value or len(value) > limit or "\x00" in value:
         raise ValueError(f"Invalid {field}")
     return value
+
+
+def managed_location(value):
+    """Bounded derived metadata only; this never proves allocation ownership."""
+    keys={'version','kind','allocationId','creationReceipt','allocationHash','owner'}
+    if not isinstance(value,dict) or set(value)!=keys or type(value['version']) is not int or value['version']!=1 or value['kind']!='managed' or value['owner']!='amplifier-unified':
+        raise ValueError('Invalid managed location projection')
+    identity=checked_string(value['allocationId'],'allocation ID',36)
+    if str(uuid.UUID(identity))!=identity or not re.fullmatch('[a-f0-9]{64}',value['allocationHash'] if isinstance(value['allocationHash'],str) else ''):
+        raise ValueError('Invalid managed allocation identity')
+    receipt=checked_string(value['creationReceipt'],'creation receipt',200)
+    if any(ord(c)<32 for c in receipt):raise ValueError('Invalid managed creation receipt')
+    return dict(value)
+
+
+def managed_root(workspace,location):
+    path=Path(workspace)
+    if not path.is_absolute() or os.path.normpath(workspace)!=workspace or len(path.parts)<5 or path.parts[-3:]!=('chats',location['allocationId'],'files'):
+        raise ValueError('Managed location differs from its exact allocation directory')
+    return str(path.parents[2])
+
+
+def managed_roots(values):
+    if values is None:
+        return []
+    if not isinstance(values,list) or len(values)>128:
+        raise ValueError('allowedManagedRoots must be a bounded list')
+    for value in values:
+        checked_string(value,'managed root')
+        if not Path(value).is_absolute() or os.path.normpath(value)!=value:
+            raise ValueError('Managed root must be a normalized absolute path')
+    return sorted(set(values))
+
+
+def authorized_scope(roots,managed):
+    """Exact indexed managed grants are independent from workspace grants."""
+    clauses,args=[],[]
+    for path in roots:
+        prefix=path.rstrip('/')+'/'
+        clauses.append('(s.workspace=? OR substr(s.workspace,1,?)=?)')
+        args.extend((path,len(prefix),prefix))
+    if managed:
+        clauses.append('EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=s.uri AND ml.workspace=s.workspace AND ml.root IN ('+','.join('?' for _ in managed)+'))')
+        args.extend(managed)
+    return '('+' OR '.join(clauses)+')' if clauses else '0',args
 
 
 class Catalog:
@@ -99,12 +146,15 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS source_sessions ON sessions(source, seen_run);
                 CREATE TABLE IF NOT EXISTS session_archive (uri TEXT PRIMARY KEY, archived INTEGER NOT NULL CHECK(archived IN (0,1)));
                 CREATE INDEX IF NOT EXISTS archived_sessions ON session_archive(archived,uri);
+                CREATE TABLE IF NOT EXISTS managed_locations(uri TEXT PRIMARY KEY,workspace TEXT NOT NULL,root TEXT NOT NULL,location TEXT NOT NULL,source TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS managed_workspace ON managed_locations(workspace,uri);
+                CREATE INDEX IF NOT EXISTS managed_roots ON managed_locations(root,uri);
                 CREATE TABLE IF NOT EXISTS native_visibility (uri TEXT PRIMARY KEY, deleted INTEGER NOT NULL, command_id TEXT NOT NULL, evidence TEXT NOT NULL);
                 DROP TRIGGER IF EXISTS workspace_visibility;
                 CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
                     WHEN OLD.availability <> NEW.availability BEGIN
                     UPDATE workspace_index SET availability=NEW.availability WHERE path=NEW.path;
-                    UPDATE sessions SET visible=(NEW.availability='present' AND NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
+                    UPDATE sessions SET visible=(NEW.availability='present' AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
                 END;
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
@@ -177,6 +227,8 @@ class Catalog:
         modified = timestamp(record.get("modifiedAt"), now)
         created = timestamp(record.get("createdAt"), modified)
         details = {k: record[k] for k in ("bundle", "description", "reason", "nativeProject") if k in record}
+        location=managed_location(record['location']) if 'location' in record else None
+        allocation_root=managed_root(workspace,location) if location else None
         raw = json.dumps(details, ensure_ascii=False)
         if len(raw.encode()) > 32768:
             raise ValueError("Catalog details exceed 32 KiB")
@@ -193,6 +245,9 @@ class Catalog:
             checked_string(confirmed_visibility.get("commandId"), "commandId", 200)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            prior_managed=db.execute('SELECT s.engine,s.native_id,ml.workspace FROM managed_locations ml JOIN sessions s ON s.uri=ml.uri WHERE ml.uri=?',(uri,)).fetchone()
+            if prior_managed and (prior_managed['engine'],prior_managed['native_id'],prior_managed['workspace'])!=(engine,native,workspace):
+                raise ValueError('Managed identity projection cannot be reassigned')
             reserved=db.execute('SELECT engine,native_id,workspace FROM native_claims WHERE uri=? LIMIT 1',(uri,)).fetchone()
             if reserved and (reserved['engine'],reserved['native_id'],reserved['workspace'])!=(engine,native,workspace):raise ValueError('Claimed AHP identity cannot be overwritten')
             if source=='host':
@@ -210,12 +265,28 @@ class Catalog:
                     known_row=matches[0];uri=known_row['uri']
                     if claims:
                         title=known_row['title'];created=known_row['created_at']
+            managed=db.execute('SELECT * FROM managed_locations WHERE uri=?',(uri,)).fetchone()
+            if managed:
+                if managed['workspace']!=workspace:
+                    raise ValueError('Managed identity projection cannot be reassigned')
+                previous_location=json.loads(managed['location'])
+                if location and location!=previous_location:
+                    if source=='host' or managed['source']!='host':raise ValueError('Managed allocation projection is immutable')
+                    # A stale scanner cannot erase or replace a host-verified projection.
+                    location=previous_location
+                else:location=previous_location
+                allocation_root=managed['root']
+            if location:
+                db.execute('INSERT INTO managed_locations VALUES(?,?,?,?,?) ON CONFLICT(uri) DO UPDATE SET source=CASE WHEN excluded.source=\'host\' THEN \'host\' ELSE managed_locations.source END',(uri,workspace,allocation_root,json.dumps(location),source))
+                details['location']=location
+            raw=json.dumps(details,ensure_ascii=False)
+            if len(raw.encode())>32768:raise ValueError('Catalog details exceed 32 KiB')
             if archive is not None:
                 db.execute("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",(uri,int(archive)))
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
-            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
+            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or not location and db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,native_id=excluded.native_id,
                 workspace=excluded.workspace,parent_uri=excluded.parent_uri,kind=excluded.kind,
@@ -287,7 +358,7 @@ class Catalog:
             raise ValueError("Confirmed native visibility evidence required")
         with self.connect() as db:
             db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(deleted), commandId, evidence))
-            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1)) WHERE uri=?", (int(deleted), uri))
+            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))) WHERE uri=?", (int(deleted), uri))
         return {"uri": uri, "deleted": deleted, "commandId": commandId}
 
     @staticmethod
@@ -299,7 +370,7 @@ class Catalog:
     def get_workspace(self, *, id):
         checked_string(id,"workspace ID",128)
         with self.connect() as db:
-            row=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE wi.id=?",(id,)).fetchone()
+            row=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE wi.id=? AND NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.workspace=wi.path)",(id,)).fetchone()
         return self._workspace_record(row) if row else None
 
     def list_workspaces(self, *, connectionId, limit=50, cursor=None, search=None, includeHidden=False, includeUnavailable=False, allowedWorkspaceRoots=None):
@@ -312,7 +383,7 @@ class Catalog:
             if not isinstance(roots,list) or len(roots)>128:raise ValueError("Bounded authorized workspace roots required")
             roots=sorted({checked_string(root,"root").rstrip('/') or '/' for root in roots})
         scope=hashlib.sha256(json.dumps(["workspaces",connectionId,search,includeHidden,includeUnavailable,roots],sort_keys=True).encode()).hexdigest()
-        where,args=[],[]
+        where,args=["NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.workspace=wi.path)"],[]
         if not includeHidden:where.append("wi.hidden=0")
         if not includeUnavailable:where.append("wi.availability='present'")
         if search:
@@ -356,6 +427,7 @@ class Catalog:
             old=db.execute("SELECT revision FROM workspace_projection WHERE source=?",(source,)).fetchone();current=old[0] if old else 0
             if current!=afterRevision:raise InvalidCursor("Workspace projection changed; inspect its checkpoint")
             for row,path,name,revision in values:
+                if db.execute('SELECT 1 FROM managed_locations WHERE workspace=? LIMIT 1',(path,)).fetchone():raise ValueError('Managed allocation is not a project workspace')
                 known=db.execute("SELECT source,hidden FROM workspace_index WHERE path=?",(path,)).fetchone()
                 if known and known['source'] not in (None,source):raise ValueError("Workspace projection belongs to a different configured owner")
                 # Existence is refreshed only for changed registrations, not ordinary queries.
@@ -460,7 +532,7 @@ class Catalog:
         result['revision']=hmac.new(self.secret,json.dumps(result,sort_keys=True).encode(),hashlib.sha256).hexdigest()
         return result
 
-    def resolve_native(self, *, engineId, identities, allowedWorkspaceRoots):
+    def resolve_native(self, *, engineId, identities, allowedWorkspaceRoots, allowedManagedRoots=None):
         """Bounded migration lookup; never guess an ambiguous native identity."""
         checked_string(engineId, "engineId", 200)
         if not isinstance(identities, list) or len(identities) > 500:
@@ -469,16 +541,11 @@ class Catalog:
         if not isinstance(allowedWorkspaceRoots, list) or len(allowedWorkspaceRoots) > 128:
             raise ValueError("allowedWorkspaceRoots must be bounded")
         roots = [checked_string(value, "workspace root").rstrip("/") or "/" for value in allowedWorkspaceRoots]
-        clauses, scope = [], []
-        for path in roots:
-            prefix = path.rstrip("/") + "/"
-            clauses.append("(workspace=? OR substr(workspace,1,?)=?)")
-            scope.extend((path, len(prefix), prefix))
-        where = "(" + " OR ".join(clauses) + ")" if clauses else "0"
+        where,scope=authorized_scope(roots,managed_roots(allowedManagedRoots))
         result = {}
         with self.connect() as db:
             for identity in identities:
-                rows = db.execute("SELECT uri FROM sessions WHERE engine=? AND native_id=? AND " + where + " LIMIT 2", (engineId, identity, *scope)).fetchall()
+                rows = db.execute("SELECT s.uri FROM sessions s WHERE s.engine=? AND s.native_id=? AND " + where + " LIMIT 2", (engineId, identity, *scope)).fetchall()
                 result[identity] = {"status": "matched", "uri": rows[0]["uri"]} if len(rows) == 1 else {"status": "ambiguous" if rows else "missing"}
         return result
 
@@ -519,7 +586,7 @@ class Catalog:
             raise InvalidCursor("Unknown, expired or altered cursor; fetch a fresh first page") from None
 
     def list(self, *, connectionId, limit=50, cursor=None, workingDirectory=None, search=None,
-             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None, archive=None,
+             parentUri=None, includeArchive=False, allowedWorkspaceRoots=None, allowedManagedRoots=None, archive=None,
              modifiedBefore=None, includeTotal=False):
         checked_string(connectionId, "connectionId", 200)
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -544,9 +611,12 @@ class Catalog:
             if not isinstance(roots, list) or len(roots) > 128:
                 raise ValueError("allowedWorkspaceRoots must be a bounded list")
             roots = sorted({checked_string(r, "workspace root").rstrip("/") or "/" for r in roots})
+        managed=managed_roots(allowedManagedRoots)
+        if allowedManagedRoots is not None and roots is None:
+            raise ValueError('Managed grants require an explicit workspace root list')
         query = {"connectionId": connectionId, "workspace": workingDirectory, "search": search,
                  "parent": parentUri, "archive": includeArchive, "archiveSelector":archive, "roots": roots,
-                 "modifiedBefore":modifiedBefore}
+                 "modifiedBefore":modifiedBefore,"managedRoots":managed}
         scope = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
         where, args = [], []
         if includeArchive:
@@ -562,12 +632,8 @@ class Catalog:
         if workingDirectory:
             where.append("s.workspace=?"); args.append(workingDirectory)
         if roots is not None:
-            alternatives = []
-            for path in roots:
-                prefix = path.rstrip("/") + "/"
-                alternatives.append("(s.workspace=? OR substr(s.workspace,1,?)=?)")
-                args.extend((path, len(prefix), prefix))
-            where.append("(" + " OR ".join(alternatives) + ")" if alternatives else "0")
+            authorized,scope_args=authorized_scope(roots,managed)
+            where.append(authorized);args.extend(scope_args)
         if search:
             where.append("(instr(lower(s.title),lower(?))>0 OR instr(lower(s.native_id),lower(?))>0)")
             args.extend((search, search))
@@ -601,14 +667,14 @@ class Catalog:
         return result
 
     def retention_candidates(self, *, connectionId, modifiedBefore, allowedWorkspaceRoots,
-                             limit=50, cursor=None, workingDirectory=None):
+                             limit=50, cursor=None, workingDirectory=None, allowedManagedRoots=None):
         """Cold candidate metadata only. Age is never permission to remove work."""
         if modifiedBefore is None:
             raise ValueError('An explicit finite cutoff is required')
         if not isinstance(allowedWorkspaceRoots, list):
             raise ValueError('An explicit authorized workspace root list is required')
         result = self.list(connectionId=connectionId, modifiedBefore=modifiedBefore,
-                           allowedWorkspaceRoots=allowedWorkspaceRoots, limit=limit, cursor=cursor,
+                           allowedWorkspaceRoots=allowedWorkspaceRoots, allowedManagedRoots=allowedManagedRoots, limit=limit, cursor=cursor,
                            workingDirectory=workingDirectory, archive='all', includeTotal=True)
         total=result.pop('total')
         return {**result, 'cutoff':modifiedBefore, 'candidateCount':total,

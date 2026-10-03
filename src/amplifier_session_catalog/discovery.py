@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 
-from .catalog import Catalog, directory_status, iso, timestamp
+from .catalog import Catalog, directory_status, iso, timestamp, managed_location, managed_root
 
 MAX_METADATA = 8 * 1024 * 1024
 METADATA = ("metadata.json", "metadata.json.backup", "naming.json", "context-intelligence/metadata.json")
@@ -62,6 +62,9 @@ def small_metadata(path):
     if not isinstance(value, dict):
         raise ValueError("Native metadata must be an object")
     result = {k: v for k, v in value.items() if k in FIELDS and (v is None or isinstance(v, (str, int, float, bool)))}
+    if 'location' in value:
+        try:result['location']=managed_location(value['location'])
+        except (ValueError,TypeError,AttributeError):result['_location_invalid']=True
     config = value.get("config")
     if isinstance(config, dict):
         for key in ("working_dir", "cwd", "project_dir", "workspace"):
@@ -167,20 +170,38 @@ class Discovery:
         if not workspace:
             return {"changed": False, "issues": issues + ["Workspace identity unresolved; project slugs are not reversible paths"]}
         previous = previous or self.catalog.by_native(self.engine_id, identity, workspace, directory)
+        location=native.get('location')
+        if location:
+            try:managed_root(workspace,location)
+            except ValueError:
+                location=None
+                issues.append('Managed location does not match native workspace; prior projection retained')
+        if native.get('_location_invalid'):
+            issues.append('Managed location is invalid; prior projection retained')
         turns = merged.get("turn_count")
-        if not previous and not (transcript and transcript[2]) and not (type(turns) is int and turns > 0):
+        if not previous and not location and not (transcript and transcript[2]) and not (type(turns) is int and turns > 0):
             return {"changed": False, "issues": issues, "empty": True}
         kind, parent = classify(identity, native, capture)
+        managed_uri=None
+        if location and kind=='root':
+            if identity!=location['allocationId']:
+                location=None
+                issues.append('Managed root native identity differs from allocation; prior projection retained')
+            else:
+                managed_uri='ahp-session:/'+location['allocationId']
+                if previous and previous['uri']!=managed_uri:
+                    return {'changed':False,'issues':issues+['Managed identity differs from existing mapping; owner repair required']}
         activity = transcript[1] / 1e9 if transcript and transcript[2] else timestamp(merged.get("last_event_at"))
         created = next((timestamp(merged[k]) for k in ("created", "created_at", "started_at")
                         if timestamp(merged.get(k))), activity)
-        uri = previous["uri"] if previous else session_uri(home, project, identity)
+        uri = previous["uri"] if previous else managed_uri or session_uri(home, project, identity)
         record = {"uri": uri, "engineId": self.engine_id, "nativeSessionId": identity,
                   "workingDirectory": workspace, "kind": kind, "storagePath": str(directory),
                   "nativeProject": project, "title": merged.get("name") or merged.get("title")
                   or merged.get("agent_name") or f"Conversation {identity[:8]}",
                   "createdAt": iso(created), "modifiedAt": iso(activity or created),
                   "availability": "read-only" if not native else "available"}
+        if location:record['location']=location
         if parent:
             parent_record = self.catalog.by_storage(directory.parent / parent)
             parent_record = parent_record or self.catalog.by_native(self.engine_id, parent, workspace, directory.parent / parent)
