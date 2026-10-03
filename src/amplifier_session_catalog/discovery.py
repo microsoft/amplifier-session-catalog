@@ -178,9 +178,6 @@ class Discovery:
                 issues.append('Managed location does not match native workspace; prior projection retained')
         if native.get('_location_invalid'):
             issues.append('Managed location is invalid; prior projection retained')
-        turns = merged.get("turn_count")
-        if not previous and not location and not (transcript and transcript[2]) and not (type(turns) is int and turns > 0):
-            return {"changed": False, "issues": issues, "empty": True}
         kind, parent = classify(identity, native, capture)
         managed_uri=None
         if location and kind=='root':
@@ -191,6 +188,12 @@ class Discovery:
                 managed_uri='ahp-session:/'+location['allocationId']
                 if previous and previous['uri']!=managed_uri:
                     return {'changed':False,'issues':issues+['Managed identity differs from existing mapping; owner repair required']}
+                existing=self.catalog.get(managed_uri)
+                if existing and (existing['engineId'],existing['nativeSessionId'],existing['workingDirectory'])!=(self.engine_id,identity,workspace):
+                    return {'changed':False,'issues':issues+['Managed identity is already bound to another source; owner repair required']}
+        turns = merged.get("turn_count")
+        if not previous and not location and not (transcript and transcript[2]) and not (type(turns) is int and turns > 0):
+            return {"changed": False, "issues": issues, "empty": True}
         activity = transcript[1] / 1e9 if transcript and transcript[2] else timestamp(merged.get("last_event_at"))
         created = next((timestamp(merged[k]) for k in ("created", "created_at", "started_at")
                         if timestamp(merged.get(k))), activity)

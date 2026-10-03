@@ -126,3 +126,20 @@ def test_noncanonical_sidecars_cannot_create_managed_identity(tmp_path):
     (directory/'naming.json').write_text(json.dumps({'location':row['location']}))
     catalog=Catalog(tmp_path/'catalog.sqlite');Discovery(catalog,[home]).hint(str(directory))
     assert 'location' not in catalog.list(connectionId='a')['items'][0]
+
+
+def test_invalid_empty_native_identity_and_existing_mapping_are_not_adopted(tmp_path):
+    _,row=managed(tmp_path);home=tmp_path/'native';catalog=Catalog(tmp_path/'catalog.sqlite')
+    base=home/'projects'/project_slug(row['workingDirectory'])/'sessions'
+    wrong=base/'wrong';wrong.mkdir(parents=True)
+    metadata={'cwd':row['workingDirectory'],'location':row['location'],'turn_count':0}
+    (wrong/'metadata.json').write_text(json.dumps(metadata))
+    discovery=Discovery(catalog,[home])
+    assert discovery.hint(str(wrong))['empty']
+    assert catalog.list(connectionId='a')['items']==[]
+    exact=base/row['nativeSessionId'];exact.mkdir()
+    (exact/'metadata.json').write_text(json.dumps(metadata))
+    other={**row,'nativeSessionId':'other'};other.pop('location');catalog.upsert(other)
+    result=discovery.hint(str(exact))
+    assert not result['changed'] and 'another source' in result['issues'][0]
+    assert catalog.get(row['uri'])['nativeSessionId']=='other'
