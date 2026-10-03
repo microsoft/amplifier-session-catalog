@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import sys
 import threading
 
 from .catalog import Catalog
 from .discovery import Discovery
+from .hints import HintInbox
 
 
 class Server:
@@ -86,6 +88,8 @@ def main():
                         help="Background metadata reconciliation seconds; zero disables")
     parser.add_argument("--workspace-check-interval", type=float, default=15,
                         help="Seconds between bounded workspace existence checks; zero disables")
+    parser.add_argument("--hint-directory", help="Optional private location-only writer hint inbox")
+    parser.add_argument("--hint-interval", type=float, default=1, help="Seconds between bounded hint batches; positive when enabled")
     args = parser.parse_args()
     catalog = Catalog(args.db)
     discovery = Discovery(catalog, args.home, known_workspaces=args.workspace, engine_id=args.engine, app_homes=args.app_home)
@@ -94,7 +98,10 @@ def main():
             parser.error("maintenance intervals cannot be negative")
         if args.scan_on_start:
             discovery.start()
-        maintenance = Maintenance(catalog, discovery, args.scan_interval, args.workspace_check_interval)
+        if args.hint_directory and (not math.isfinite(args.hint_interval) or args.hint_interval <= 0):
+            parser.error("hint interval must be positive")
+        inbox = HintInbox(args.hint_directory, discovery) if args.hint_directory else None
+        maintenance = Maintenance(catalog, discovery, args.scan_interval, args.workspace_check_interval, inbox, args.hint_interval)
         maintenance.start()
         try:
             Server(catalog, discovery).serve()
@@ -109,8 +116,9 @@ def main():
 class Maintenance:
     """One bounded background reconciler; interactive reads never perform I/O scans."""
 
-    def __init__(self, catalog, discovery, scan_interval=300, workspace_interval=15):
+    def __init__(self, catalog, discovery, scan_interval=300, workspace_interval=15, inbox=None, hint_interval=1):
         self.catalog, self.discovery = catalog, discovery
+        self.inbox, self.hint_interval = inbox, hint_interval
         self.scan_interval, self.workspace_interval = scan_interval, workspace_interval
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, name="catalog-maintenance", daemon=True)
@@ -123,9 +131,13 @@ class Maintenance:
         now = time.monotonic()
         next_scan = now + self.scan_interval if self.scan_interval else float("inf")
         next_workspace = now + self.workspace_interval if self.workspace_interval else float("inf")
-        while not self.stop.wait(min(max(0, min(next_scan, next_workspace) - time.monotonic()), 60)):
+        next_hint = now + self.hint_interval if self.inbox else float("inf")
+        while not self.stop.wait(min(max(0, min(next_scan, next_workspace, next_hint) - time.monotonic()), 60)):
             now = time.monotonic()
             try:
+                if now >= next_hint:
+                    self.inbox.drain(limit=64)
+                    next_hint = now + self.hint_interval
                 if now >= next_workspace:
                     self.catalog.recheck_workspaces(limit=64)
                     next_workspace = now + self.workspace_interval
@@ -137,10 +149,13 @@ class Maintenance:
                 # Avoid retry storms while the source or database is unavailable.
                 next_workspace = now + max(15, self.workspace_interval) if self.workspace_interval else float("inf")
                 next_scan = now + max(15, self.scan_interval) if self.scan_interval else float("inf")
+                next_hint = now + max(1, self.hint_interval) if self.inbox else float("inf")
 
     def close(self):
         self.stop.set()
         self.thread.join(timeout=10)
+        if self.inbox and not self.thread.is_alive():
+            self.inbox.close()
 
 
 if __name__ == "__main__":

@@ -122,3 +122,44 @@ read only bounded, identity-matching markers, never transcript/event bodies.
 There is no guessed user home. Invalid markers retain previous visibility and
 produce an issue. A confirmed native restore marker or receipt re-enables the
 row; an absent marker is not restore evidence.
+
+## Optional writer hint inbox (v1)
+
+Writers which cannot reach the live catalog process may opt into a private local
+spool. This is the same location-only trust boundary as `hint({sessionDirectory})`;
+it is an efficiency hint, never a second session store or delivery receipt.
+
+```sh
+amplifier-session-catalog serve --db /private/catalog.sqlite \
+  --home /configured/native-home --hint-directory /private/catalog-hints \
+  --scan-on-start
+```
+
+Inbox v1 is POSIX-only; native RPC hints and ordinary scans remain portable.
+The directory must be absolute, private to the same OS user (mode 0700 on POSIX),
+and not a symlink. `--hint-interval` defaults to one second. Each background pass
+examines at most 64 directory entries; it never runs on a catalog list/get query.
+An incremental directory iterator prevents unrelated entries from forcing an
+unbounded listing or starving later notices. The usual metadata reconciliation and
+workspace checks remain enabled and repair missing/lost notices.
+
+A writer emits this exact JSON object, at most 8 KiB, **after** its successful native
+save: `{"version":1,"sessionDirectory":"/absolute/native/session/directory"}`.
+The filename is lowercase SHA-256 of the UTF-8 absolute directory plus `.json`.
+Write a mode-0600 unique temporary file and atomically replace that filename. Repeated
+saves coalesce to one pending notice per session; no title, transcript, event payload,
+or client state is accepted. Writers must not scan the spool, spawn a catalog, or
+make successful native persistence depend on notice delivery. The spool has bounded
+individual records and bounded consumer batches, not a global disk quota.
+
+The consumer atomically claims a notice under `<hash>.processing-<32 hex chars>`
+before reading it, so a later writer's notice cannot be deleted by the old consumer.
+Crash claims are rediscovered. Invalid versions, filenames, roots, special files,
+symlinks, and oversized records are rejected; transient index/I/O failures retain the
+claim for a later batch. Every accepted location passes through `Discovery.hint`'s
+configured native-root and metadata validation. Native events/transcripts are never
+opened by hint processing (transcript stat remains part of change detection).
+
+The legacy CLI opt-in is `AMPLIFIER_SESSION_CATALOG_HINT_DIRECTORY`, pointing to the
+same directory. Native ACP notifications continue using the live `hint` RPC; neither
+path requires or introduces a different canonical-history format.
