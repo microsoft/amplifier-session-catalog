@@ -1,5 +1,9 @@
 # Amplifier session catalog
 
+Start with the [local vision](VISION.md), [catalog contract v1](contracts/catalog.v1.md)
+and [contributor entry](AGENTS.md). The existing API reference below defines method
+shapes; the contract maps approved promises to checks and remaining qualification.
+
 A rebuildable SQLite index for workspace and native session discovery. It never
 loads an agent, imports Amplifier's kernel, reads event/transcript contents, or
 writes native history. Interactive list/get operations query the index only.
