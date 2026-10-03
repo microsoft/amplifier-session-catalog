@@ -1,0 +1,68 @@
+{
+  "status": "catalog-component-candidate; host integration required",
+  "baseline": "36fe815b5cf95b92e4a17b6ed7e540b8eab874ff",
+  "protocol": "trusted local catalog JSON-RPC v1; additive; no AHP or ACP core delta",
+  "methods": {
+    "projectSessionVisibility": {
+      "params": {
+        "source": "bounded host-instance owner ID",
+        "commandId": "bounded exact child command",
+        "afterRevision": "nonnegative integer expected checkpoint",
+        "throughRevision": "strictly greater integer",
+        "items": [
+          {
+            "uri": "exact indexed stable identity",
+            "hidden": "boolean",
+            "revision": "integer in (afterRevision,throughRevision]"
+          }
+        ]
+      },
+      "limit": 100,
+      "result": {
+        "source": "same owner",
+        "commandId": "same command",
+        "revision": "throughRevision",
+        "projected": "item count"
+      },
+      "atomicity": "SQLite immediate write transaction: exact-command signature lookup before CAS; all validation and row writes and checkpoint and receipt commit atomically; conflicting source, duplicate URI, missing identity, bad revision or changed command refuses whole batch"
+    },
+    "sessionVisibilityProjectionStatus": {
+      "params": {
+        "source": "owner ID"
+      },
+      "result": {
+        "source": "owner ID",
+        "revision": "applied checkpoint or 0"
+      }
+    },
+    "sessionVisibilityProjectionReceipt": {
+      "params": {
+        "source": "owner ID",
+        "commandId": "exact command"
+      },
+      "result": "original result or null; passive"
+    }
+  },
+  "storage": "Separate product-only derived visibility/checkpoint/command tables. No native_visibility writes. Host owns canonical reset, retained before-images and no-replay journals; catalog receipts are only rebuildable projection evidence.",
+  "readEffects": "Filter hidden rows before root/child/archive/retention pagination; exact get exposes productHidden. Descendant and directory-use guards include hidden histories. Metadata/native restore/workspace recheck do not revive hidden product rows.",
+  "resetAndUndo": "Host first verifies eligibility, exact retained selection and held maintenance. Reset projects hidden:true. Fresh revision-bound retained restore projects exact prior hidden flags at newer revisions. Catalog does not grant reset/deletion authority or inspect foreign receipts.",
+  "rebuild": "Host rebuilds derived catalog from its retained visibility records in bounded batches. Catalog checkpoint resets to 0 on DB loss. For indexed-only proposal, host must fence listing until facts and visibility projection reconstruction are complete.",
+  "preserved": [
+    "native metadata/transcript/events",
+    "workspace and managed files",
+    "host accepted and unknown input provenance",
+    "queue/steering/transfer/lifecycle/import receipts",
+    "independent owner artifacts",
+    "client drafts"
+  ],
+  "acceptance": [
+    "changed-command rejection and exact retry after restart",
+    "atomic rollback on mixed valid/invalid batch",
+    "concurrent CAS only one writer",
+    "native restore and metadata discovery cannot revive hidden rows",
+    "restore does not bypass native deletion or workspace exclusion",
+    "metadata-only source and installed package checks",
+    "4000-workspace 25000/100000-session fixture and hidden-row query work bound"
+  ],
+  "rebuildHandshake": "Host-owned durable unavailable fence; immutable stable-URI paged snapshot; reconstruct identities; checkpoint0 replay in max100 contiguous projection sequence batches with exact epoch/page commands; reconcile original receipts; drain subsequent changes; release only after final checkpoint and row-count manifest verify. README is normative for host handshake."
+}

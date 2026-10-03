@@ -1,5 +1,9 @@
 # Amplifier session catalog
 
+Start with the [local vision](VISION.md), [catalog contract v1](contracts/catalog.v1.md)
+and [contributor entry](AGENTS.md). The existing API reference below defines method
+shapes; the contract maps approved promises to checks and remaining qualification.
+
 A rebuildable SQLite index for workspace and native session discovery. It never
 loads an agent, imports Amplifier's kernel, reads event/transcript contents, or
 writes native history. Interactive list/get operations query the index only.
@@ -308,3 +312,83 @@ never reads transcript or event bodies for this repair. `discoveryComplete` is
 separate from graph/index completeness and is true only for a completed scan
 without issues. Callers must also check freshness; neither field excludes an
 external writer or proves a current native family lease.
+
+### Product conversation presentation visibility
+
+`projectSessionVisibility({source,commandId,afterRevision,throughRevision,items})`
+is an additive trusted-host projection seam for product presentation reset. Each
+item is exactly `{uri,hidden,revision}`; a batch contains at most 100 unique,
+already-indexed session URIs. Revisions are nonnegative signed 64-bit integers,
+with `afterRevision < revision <= throughRevision`. `source` and `commandId` are
+nonempty strings of at most 200 characters. Unknown fields, identities, owners,
+changed command content and stale checkpoints refuse the entire batch.
+
+The transaction atomically applies rows, its source checkpoint and an exact
+projection receipt. The result is `{source,commandId,revision,projected}`.
+`sessionVisibilityProjectionStatus({source})` returns `{source,revision}` (zero
+before any batch). `sessionVisibilityProjectionReceipt({source,commandId})`
+returns the original result or null without writing. An exact command retry
+returns its original result even after restart or a newer batch; it never repeats
+an older visibility change. A URI belongs to its first projection source, including
+a restored row. Empty batches may advance a checkpoint. Item order is part of
+command identity. Callers keep original commands until outcomes are reconciled.
+
+Product-hidden rows are excluded before root/child/archive/retention pagination.
+Exact `get` reports `productHidden`; safety family and directory-use guards retain
+these references. Native visibility, workspace existence and product visibility
+remain independent. Native restore, scans, ordinary metadata writes and workspace
+rechecks cannot revive a product-hidden row. A fresh host-reviewed restore projects
+the retained prior `hidden` flag at a newer revision; clearing it cannot bypass
+native deletion or unavailable/hidden workspace filtering.
+
+This index grants no reset, deletion, execution or maintenance authority. The host
+owns eligibility checks, held maintenance, exact immutable selection, retained
+before-images, reset/restore revisions and durable no-replay journals. Its reset
+must preserve canonical history, receipts, files and independent artifacts. It
+must restore the prior flag, rather than assume all rows were previously visible.
+The catalog never forges native tombstones or reads native transcript/event bodies.
+
+After catalog loss, the host rebuilds indexed identities and projects retained
+visibility facts in bounded batches starting at checkpoint zero. **The host must
+fence client listing and adoption until reconstruction completes**, so discovery
+cannot temporarily reveal product-hidden histories. This indexed-only seam does
+not accept markers ahead of discovery. A source identity stays stable across host
+restarts; changes require an explicit migration, not a guessed new owner. Catalog
+projection receipts are rebuildable index evidence, not the host's reset journals.
+Source and independently installed component tests do not qualify the host reset
+transaction, client controls, browser/device/account behavior or live adoption.
+
+#### Host snapshot/rebuild handshake
+
+The host composes the projection with this explicit handshake:
+
+1. Enter and persist a host-owned catalog-rebuild fence before replacing or
+   reopening a lost index. While fenced, product list/adoption returns unavailable;
+   native discovery and these trusted catalog methods remain usable. Do not infer
+   readiness from a completed native scan or from an empty visibility checkpoint.
+2. Capture an immutable, cold host-authoritative visibility snapshot with stable
+   URI order, exact row count, snapshot identity and retained prior flags. Fence
+   reset/restore mutations or journal and drain subsequent changes before release.
+   The host owns paging this snapshot without omitting rows; each page has at most
+   100 items. Catalog live-list cursors are not immutable snapshot cursors.
+3. Reconstruct indexed identities, then read
+   `sessionVisibilityProjectionStatus({source})`. On a fresh database it is zero.
+   Project snapshot pages in contiguous checkpoint batches, always passing the
+   last confirmed checkpoint as `afterRevision`. Projection revisions are the
+   host's monotonic **projection batch sequence**, separate from its reset/undo
+   policy revision; all rows in a page may use that page's `throughRevision`.
+   Use exact original rebuild-epoch/page command IDs and retain each full batch.
+4. If a response is lost, inspect that page's exact receipt. Exact retry is safe
+   only with the original content; an old successful receipt never rewinds newer
+   flags. Verify its result and checkpoint before moving to the next page. An
+   unknown/changed checkpoint, missing indexed identity, owner conflict or partial
+   host snapshot leaves the fence in place; do not skip ahead or invent success.
+5. Release product listing only after every snapshot page and subsequent change
+   batch has a matching receipt, the final checkpoint matches the retained replay
+   manifest, and indexed reconstruction is complete. Persist host readiness under
+   its own CAS so a restart cannot open listing ahead of replay. An empty snapshot
+   still uses an explicit empty final checkpoint batch and readiness record.
+
+This component does not implement that host fence or snapshot authority. The host
+integration must qualify index loss, interrupted rebuild, restart, and concurrent
+reset/restore admission before enabling the product reset control.

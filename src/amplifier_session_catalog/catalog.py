@@ -152,11 +152,19 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS managed_workspace ON managed_locations(workspace,uri);
                 CREATE INDEX IF NOT EXISTS managed_roots ON managed_locations(root,uri);
                 CREATE TABLE IF NOT EXISTS native_visibility (uri TEXT PRIMARY KEY, deleted INTEGER NOT NULL, command_id TEXT NOT NULL, evidence TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS product_visibility (
+                    uri TEXT PRIMARY KEY, source TEXT NOT NULL, hidden INTEGER NOT NULL CHECK(hidden IN (0,1)), revision INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS product_visibility_projection (source TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS product_visibility_commands (
+                    source TEXT NOT NULL, command_id TEXT NOT NULL, signature TEXT NOT NULL, result TEXT NOT NULL,
+                    PRIMARY KEY(source,command_id)
+                );
                 DROP TRIGGER IF EXISTS workspace_visibility;
                 CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
                     WHEN OLD.availability <> NEW.availability BEGIN
                     UPDATE workspace_index SET availability=NEW.availability WHERE path=NEW.path;
-                    UPDATE sessions SET visible=(NEW.availability='present' AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=NEW.path;
+                    UPDATE sessions SET visible=(NEW.availability='present' AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1)) WHERE workspace=NEW.path;
                 END;
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
@@ -313,7 +321,7 @@ class Catalog:
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
-            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or not location and db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
+            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or db.execute("SELECT 1 FROM product_visibility WHERE uri=? AND hidden=1", (uri,)).fetchone() or not location and db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,native_id=excluded.native_id,
                 workspace=excluded.workspace,parent_uri=excluded.parent_uri,kind=excluded.kind,
@@ -381,6 +389,75 @@ class Catalog:
         with self.connect() as db:db.executemany("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",values)
         return {'projected':len(values)}
 
+    def session_visibility_projection_status(self, *, source):
+        checked_string(source, 'source', 200)
+        with self.connect() as db:
+            row = db.execute('SELECT revision FROM product_visibility_projection WHERE source=?', (source,)).fetchone()
+        return {'source': source, 'revision': row['revision'] if row else 0}
+
+    def session_visibility_projection_receipt(self, *, source, commandId):
+        checked_string(source, 'source', 200)
+        checked_string(commandId, 'commandId', 200)
+        with self.connect() as db:
+            row = db.execute('SELECT result FROM product_visibility_commands WHERE source=? AND command_id=?',
+                             (source, commandId)).fetchone()
+        return json.loads(row['result']) if row else None
+
+    def project_session_visibility(self, *, source, commandId, afterRevision, throughRevision, items):
+        """Rebuildable product projection; the host owns reset authority and undo."""
+        checked_string(source, 'source', 200)
+        checked_string(commandId, 'commandId', 200)
+        if (type(afterRevision) is not int or type(throughRevision) is not int
+                or not 0 <= afterRevision < throughRevision <= 9223372036854775807):
+            raise ValueError('Strict increasing projection revisions required')
+        if not isinstance(items, list) or len(items) > 100:
+            raise ValueError('Visibility projection requires at most 100 items')
+        values = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {'uri', 'hidden', 'revision'}:
+                raise ValueError('Exact visibility projection item required')
+            uri = checked_string(item['uri'], 'uri', 512)
+            if uri in seen or type(item['hidden']) is not bool:
+                raise ValueError('Unique URI and boolean hidden flag required')
+            if type(item['revision']) is not int or not afterRevision < item['revision'] <= throughRevision:
+                raise ValueError('Visibility item outside batch revision')
+            seen.add(uri)
+            values.append((uri, source, int(item['hidden']), item['revision']))
+        signature = hashlib.sha256(json.dumps([afterRevision, throughRevision, items],
+                                   sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        result = {'source': source, 'commandId': commandId, 'revision': throughRevision, 'projected': len(values)}
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            prior = db.execute('SELECT signature,result FROM product_visibility_commands WHERE source=? AND command_id=?',
+                               (source, commandId)).fetchone()
+            if prior:
+                if prior['signature'] != signature:
+                    raise ValueError('Visibility command content changed')
+                return json.loads(prior['result'])
+            row = db.execute('SELECT revision FROM product_visibility_projection WHERE source=?', (source,)).fetchone()
+            if (row['revision'] if row else 0) != afterRevision:
+                raise InvalidCursor('Visibility projection changed; inspect its checkpoint and exact receipt')
+            for uri, owner, hidden, revision in values:
+                if not db.execute('SELECT 1 FROM sessions WHERE uri=?', (uri,)).fetchone():
+                    raise ValueError('Visibility identity must already be indexed')
+                prior_owner = db.execute('SELECT source FROM product_visibility WHERE uri=?', (uri,)).fetchone()
+                if prior_owner and prior_owner['source'] != owner:
+                    raise ValueError('Visibility projection belongs to another source')
+                db.execute('INSERT INTO product_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET hidden=excluded.hidden,revision=excluded.revision',
+                           (uri, owner, hidden, revision))
+                db.execute("""UPDATE sessions SET visible=(?=0
+                    AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present')
+                    AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri)
+                        OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))
+                    AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1))
+                    WHERE uri=?""", (hidden, uri))
+            db.execute('INSERT INTO product_visibility_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision',
+                       (source, throughRevision))
+            db.execute('INSERT INTO product_visibility_commands VALUES(?,?,?,?)',
+                       (source, commandId, signature, json.dumps(result)))
+        return result
+
     def set_visibility(self, *, uri, nativeSessionId, workingDirectory, deleted, commandId, evidence):
         """Derived visibility only, after exact storage-owner confirmation. No file mutation."""
         current = self.get(checked_string(uri, "uri", 512))
@@ -393,7 +470,7 @@ class Catalog:
             raise ValueError("Confirmed native visibility evidence required")
         with self.connect() as db:
             db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(deleted), commandId, evidence))
-            db.execute("UPDATE sessions SET visible=(?=0 AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))) WHERE uri=?", (int(deleted), uri))
+            db.execute("UPDATE sessions SET visible=(?=0 AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))) WHERE uri=?", (int(deleted), uri))
         return {"uri": uri, "deleted": deleted, "commandId": commandId}
 
     @staticmethod
@@ -470,7 +547,7 @@ class Catalog:
                 db.execute("INSERT INTO workspaces VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability,checked_at=excluded.checked_at",(path,availability,time.time()))
                 db.execute("INSERT INTO workspace_index VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,availability=excluded.availability,registered=excluded.registered,hidden=excluded.hidden,revision=excluded.revision,source=excluded.source",(path,row['id'],name,name.casefold(),availability,int(row['registered']),int(row['hidden']),revision,source))
                 if bool(known['hidden'] if known else False)!=row['hidden']:
-                    db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
+                    db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
             db.execute("INSERT INTO workspace_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision",(source,throughRevision))
         return {"source":source,"revision":throughRevision,"projected":len(records)}
 
@@ -483,6 +560,7 @@ class Catalog:
                   "createdAt": iso(row["created_at"]), "modifiedAt": iso(row["modified_at"]),
                   "availability": row["availability"], "workspaceAvailability": row["workspace_availability"],
                   "indexedAt": iso(row["indexed_at"]), "status": "idle", "isArchived": bool(row["is_archived"]) if "is_archived" in row.keys() else False, "nativeDeleted": bool(row["native_deleted"]) if "native_deleted" in row.keys() else False}
+        result["productHidden"] = bool(row["product_hidden"]) if "product_hidden" in row.keys() else False
         if row["parent_uri"]:
             result["parentUri"] = row["parent_uri"]
         if row["storage_path"]:
@@ -493,7 +571,7 @@ class Catalog:
     def get(self, uri):
         checked_string(uri, "uri", 512)
         with self.connect() as db:
-            row = db.execute("SELECT s.*, COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived, w.availability AS workspace_availability, EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AS native_deleted FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
+            row = db.execute("SELECT s.*, COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived, w.availability AS workspace_availability, EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AS native_deleted, EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=s.uri AND pv.hidden=1) AS product_hidden FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE uri=?", (uri,)).fetchone()
         return self._record(row)
 
     def by_storage(self, path):
@@ -660,7 +738,7 @@ class Catalog:
         scope = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
         where, args = [], []
         if includeArchive:
-            where.append("NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1)")
+            where.append("NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=s.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=s.uri AND pv.hidden=1)")
         if not includeArchive:
             where.append("s.visible=1")
         if archive in {'active','archived'}:
