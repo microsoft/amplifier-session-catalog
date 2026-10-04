@@ -6,6 +6,10 @@ page of existing workspaces and root conversations, then open children and detai
 on demand. Discovery must never start an agent, replay accepted work, or alter the
 native records it describes. Small changes should touch their indexed dependencies,
 not materialize the whole installation.
+Deep pages must seek past already visited rows, including timestamp ties.
+Losing a client cache or connection rebuilds a bounded view from the disk index;
+external writers announce changed locations instead of making browsing scan
+dormant history. Initial metadata reconstruction is a separate cold operation.
 
 This is the catalog specialization of the
 [approved Unified family vision](https://github.com/microsoft/amplifier-unified/blob/625af2f2832fafc8152f6078061d626f160362a4/docs/architecture/VISION.md)

@@ -763,11 +763,17 @@ class Catalog:
             data = self._decode(cursor)
             if data.get("scope") != scope:
                 raise InvalidCursor("Cursor belongs to another connection or query")
-            where.append("(s.modified_at < ? OR (s.modified_at=? AND s.uri>?))")
-            args.extend((data["modified"], data["modified"], data["uri"]))
         sql = "SELECT s.*,COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived,w.availability AS workspace_availability FROM sessions s JOIN workspaces w ON s.workspace=w.path WHERE " + " AND ".join(where)
-        sql += " ORDER BY s.modified_at DESC,s.uri LIMIT ?"
-        args.append(limit + 1)
+        if cursor:
+            # The mixed descending-time/ascending-URI key cannot be expressed
+            # as one row-value comparison. Separate disjoint ranges let SQLite
+            # seek both parts of the ordering index, including large time ties.
+            sql = (sql + " AND s.modified_at=? AND s.uri>? UNION ALL " + sql
+                   + " AND s.modified_at<? ORDER BY modified_at DESC,uri LIMIT ?")
+            args = [*args, data['modified'], data['uri'], *args, data['modified'], limit+1]
+        else:
+            sql += " ORDER BY s.modified_at DESC,s.uri LIMIT ?"
+            args.append(limit + 1)
         with self.connect() as db:
             # An optional explicit count uses the same read snapshot as this page.
             # Ordinary navigation never pays for counting the whole result set.

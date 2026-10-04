@@ -91,6 +91,9 @@ after AHP reconnect, catalog restart or changed query; never persist the cursor
 across connections. The list is live, with deterministic modified-time/URI order;
 concurrent modifications are reconciled through host catalog invalidation/refetch,
 not a promise of snapshot isolation across multiple requests.
+Continuation queries seek separate equal-timestamp and older-timestamp index
+ranges. Already skipped roots or children, including large timestamp ties, do
+not have to be walked again to fill the next page.
 
 The visible-root index materializes only directory eligibility, updated when that
 workspace's existence changes. Query cost does not walk all the newer invisible
@@ -109,6 +112,19 @@ component evidence, not Spark-1 scale or real-account execution acceptance.
 25,000 and 100,000 sessions, then measures paged reads and individual summary
 updates in fresh processes. It reports its evidence boundary with the results;
 the fixture paths do not touch real native history.
+
+`python scripts/qualify_large_history.py --output /absolute/receipt.json` builds
+an owned physical fixture with 4,000 historical project namespaces, 25,000 native
+metadata records and 100 existing workspaces. Run it with an independently
+installed wheel. It checks existing-only project/root pages, lazy child pages,
+fresh stdio owners and cursor rejection after reconnect/restart, explicitly
+announced incremental metadata/tombstone updates, passive selected-family races
+and bounded retention pages. Audit hooks reject transcript/event body reads and
+catalog-origin canonical writes. Hot queries must stay below 25,000 SQLite VM
+steps and 256 KiB per page, with at most 26 result rows held for a 25-row page;
+the fixture process must remain below 128 MiB peak RSS. Initial reconstruction
+and explicit retention counts are disk-wide metadata work, measured separately.
+This qualifies synthetic announcements, not adoption by a real legacy CLI.
 
 Native lifecycle visibility is a separate derived index. `setVisibility` accepts
 an exact indexed `uri`, `nativeSessionId`, `workingDirectory`, `deleted` boolean,
@@ -164,9 +180,12 @@ claim for a later batch. Every accepted location passes through `Discovery.hint`
 configured native-root and metadata validation. Native events/transcripts are never
 opened by hint processing (transcript stat remains part of change detection).
 
-The legacy CLI opt-in is `AMPLIFIER_SESSION_CATALOG_HINT_DIRECTORY`, pointing to the
-same directory. Native ACP notifications continue using the live `hint` RPC; neither
-path requires or introduces a different canonical-history format.
+The proposed legacy CLI opt-in is `AMPLIFIER_SESSION_CATALOG_HINT_DIRECTORY`,
+pointing to the same directory. The CLI owner must implement post-save notices
+and qualify its actual installed writer; an environment variable alone enables
+nothing. Catalog does not watch every history directory to substitute for that
+missing integration. Native ACP notifications continue using the live `hint`
+RPC; neither path requires a different canonical-history format.
 
 ### Workspace metadata and registration projection
 
