@@ -114,9 +114,18 @@ def publication_stamp(path):
 
 
 class Discovery:
-    def __init__(self, catalog: Catalog, homes, *, known_workspaces=(), engine_id="amplifier", app_homes=()):
+    def __init__(self, catalog: Catalog, homes, *, known_workspaces=(), engine_id="amplifier", app_homes=(), initially_empty_homes=()):
         self.catalog = catalog
-        self.homes = tuple(Path(home).expanduser().resolve() for home in homes)
+        configured = tuple(Path(home).expanduser() for home in homes)
+        self.homes = tuple(home.resolve() for home in configured)
+        self.initially_empty_homes = frozenset(Path(home).expanduser() for home in initially_empty_homes)
+        for home in self.initially_empty_homes:
+            try:
+                valid = home in configured and home.is_absolute() and home.resolve() == home and stat.S_ISDIR(home.lstat().st_mode)
+            except OSError:
+                valid = False
+            if not valid:
+                raise ValueError("Initially empty home must exactly match a configured canonical existing directory")
         self.known = {project_slug(path): str(Path(path).expanduser().resolve()) for path in known_workspaces}
         self.engine_id = engine_id
         self.app_homes = tuple(Path(home).expanduser().resolve() for home in app_homes)
@@ -537,6 +546,35 @@ class Discovery:
                 if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False):
                     yield Path(entry.path)
 
+    def _project_directories(self, home):
+        projects = home / "projects"
+        observation = "native-projects:" + str(home)
+        try:
+            with os.scandir(projects) as entries:
+                # Private derived evidence also remembers an observed empty root.
+                with self.catalog.connect() as db:
+                    db.execute("INSERT OR IGNORE INTO progress VALUES(?,?)", (observation, '{"observed":true}'))
+                for entry in entries:
+                    if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False):
+                        yield Path(entry.path)
+        except FileNotFoundError:
+            # First use creates projects lazily. Never reinterpret loss of a
+            # known namespace, a missing home, or a dangling link as empty.
+            try:
+                projects.lstat()
+            except FileNotFoundError:
+                if not stat.S_ISDIR(home.lstat().st_mode):
+                    raise
+                prefix = str(projects) + os.sep
+                upper = str(projects) + chr(ord(os.sep) + 1)
+                with self.catalog.connect() as db:
+                    known = (db.execute("SELECT 1 FROM progress WHERE key=?", (observation,)).fetchone()
+                             or db.execute("SELECT 1 FROM sessions WHERE source=? LIMIT 1", ("native:" + str(home),)).fetchone()
+                             or db.execute("SELECT 1 FROM sessions WHERE storage_path>=? AND storage_path<? LIMIT 1", (prefix, upper)).fetchone())
+                if home in self.initially_empty_homes and not known:
+                    return
+            raise
+
     def scan(self):
         if not self._lock.acquire(blocking=False):
             return self.catalog.progress()
@@ -550,7 +588,7 @@ class Discovery:
                 if self.stop.is_set():
                     break
                 try:
-                    for project in self._directories(home / "projects"):
+                    for project in self._project_directories(home):
                         if self.stop.is_set():
                             break
                         state["projects"] += 1

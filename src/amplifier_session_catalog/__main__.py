@@ -85,6 +85,8 @@ def main():
     parser.add_argument("command", choices=("serve", "scan", "list"))
     parser.add_argument("--db", required=True)
     parser.add_argument("--home", action="append", default=[])
+    parser.add_argument("--initially-empty-home", action="append", default=[],
+                        help="Trusted fresh-deployment declaration for an exact configured existing home; permits an absent, never-observed projects namespace")
     parser.add_argument("--app-home", action="append", default=[], help="Explicit native adapter state home for lifecycle visibility markers")
     parser.add_argument("--workspace", action="append", default=[])
     parser.add_argument("--engine", default="amplifier")
@@ -97,7 +99,11 @@ def main():
     parser.add_argument("--hint-interval", type=float, default=1, help="Seconds between bounded hint batches; positive when enabled")
     args = parser.parse_args()
     catalog = Catalog(args.db)
-    discovery = Discovery(catalog, args.home, known_workspaces=args.workspace, engine_id=args.engine, app_homes=args.app_home)
+    try:
+        discovery = Discovery(catalog, args.home, known_workspaces=args.workspace, engine_id=args.engine, app_homes=args.app_home,
+                              initially_empty_homes=args.initially_empty_home)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.command == "serve":
         if args.scan_interval < 0 or args.workspace_check_interval < 0:
             parser.error("maintenance intervals cannot be negative")

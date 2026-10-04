@@ -36,6 +36,21 @@ Location-only writer hints provide prompt discovery between reconciliations.
 Workspace existence is an indexed observation, not a permanent claim about a mount.
 Maintenance exceptions are reported on stderr without resetting the index.
 
+A trusted fresh-deployment caller may repeat `--initially-empty-home /exact/home`
+for an existing canonical directory also configured by the same exact `--home`.
+The Python equivalent is `Discovery(..., initially_empty_homes=[...])`. This
+explicit caller declaration permits a never-observed, absent `projects` child to
+complete as empty; it does not create native paths or infer pristine history from
+an empty index. Without the declaration, missing namespaces remain issues.
+Previously observed namespaces, including empty ones, and retained indexed native
+sources or host storage mappings keep missing-root failures even with the declaration. Permission,
+non-directory, dangling-link and corrupt-metadata failures remain issues. Symlink,
+noncanonical, missing, non-directory or unconfigured declared homes are rejected.
+Private namespace observations are rebuildable index state, not native authority.
+A caller must not declare a retained or index-loss recovery home fresh: history
+lost before any retained catalog observation cannot be distinguished from first
+use by the index alone.
+
 ## Stdio interface v1
 
 UTF-8 newline-delimited JSON-RPC 2.0 on stdin/stdout. Responses may arrive out of
