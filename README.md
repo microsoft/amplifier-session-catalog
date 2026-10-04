@@ -180,9 +180,10 @@ claim for a later batch. A private discovery adapter also retains a claim when
 native metadata admission or authoritative lifecycle reads fail with typed transient
 I/O/descriptor races, or a selected-source presence confirmation changes mid-check.
 Public `hint` results and notice fields are unchanged. A failed native read does
-not overwrite indexed metadata from another successful drainer. Partial lifecycle
-proofs do not change native visibility while an owner source is unreadable; any
-provisional valid metadata projection leaves its fingerprint uncached for retry.
+not overwrite indexed metadata from another successful drainer. Transient
+lifecycle failures also return before publishing native metadata, partial lifecycle
+proofs or fingerprints. Prior state stays unchanged; a successful competing drainer
+may consume the shared claim without being overwritten by the older failure.
 Current valid native/backup metadata with optional naming/capture failures remains
 accepted. Malformed or missing native metadata alone is not a transient signal;
 malformed notices, unsafe paths and unconfigured roots remain rejected. Persistent

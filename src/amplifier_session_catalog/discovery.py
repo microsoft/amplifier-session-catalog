@@ -293,11 +293,12 @@ class Discovery:
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
-        retry_required=retry_transient and transient_lifecycle
-        if retry_required:confirmation=None
-        # A provisional projection cannot cache a failed authoritative read as
-        # complete; unchanged source stamps must still retry on the next pass.
-        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=None if retry_required else fingerprint, seen_run=run, confirmed_visibility=confirmation,
+        if retry_transient and transient_lifecycle:
+            # An older failed drainer has no newer facts to publish, including
+            # its earlier native metadata or partial lifecycle confirmations.
+            # A successful competitor may already have consumed their claim.
+            raise RetryableHint('Selected authoritative metadata temporarily unavailable')
+        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
                             native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
         if native and not issues and previous and previous.get("source_missing"):
             def present():
@@ -306,7 +307,6 @@ class Discovery:
                 return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (directory_info.st_dev, directory_info.st_ino) and [file_stamp(directory/name) for name in METADATA] == stamps
             restored=self.catalog._observe_source_presence({**record, 'uri': indexed['uri']}, missing=False, confirm=present)
             if not restored and retry_transient:raise RetryableHint('Selected source changed during presence restoration')
-        if retry_required:raise RetryableHint('Selected authoritative metadata temporarily unavailable')
         return {"uri": uri, "changed": True, "issues": issues}
 
     def _family_inventory(self, namespace, budget):

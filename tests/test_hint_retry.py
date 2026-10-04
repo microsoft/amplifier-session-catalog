@@ -192,3 +192,26 @@ def test_partial_lifecycle_proofs_do_not_change_visibility_while_another_owner_r
     assert inbox.drain()['failed']==1 and not c.get(uri)['nativeDeleted'];inbox.close()
     monkeypatch.setattr(module,'read_metadata_json',original)
     assert inbox.drain()['processed']==1 and c.get(uri)['nativeDeleted'];inbox.close()
+
+
+def test_older_failed_lifecycle_cannot_rewind_newer_projection(tmp_path,monkeypatch):
+    app=tmp_path/'adapter';c,d,inbox,directory=fixture(tmp_path,app_homes=[app]);uri=d.hint(str(directory))['uri']
+    metadata=directory/'metadata.json'
+    metadata.write_text(json.dumps({'working_dir':c.get(uri)['workingDirectory'],'name':'Older title','turn_count':1}))
+    marker=app/'sessions'/'one'/'lifecycle.json';marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({'sessionId':'one','historyCwd':c.get(uri)['workingDirectory'],'deleted':False,'commandId':'native-visible'}))
+    p=next(inbox.directory.iterdir());claim=p.with_name(p.stem+'.processing-'+'b'*32);p.rename(claim)
+    other=HintInbox(inbox.directory,d);original=module.read_metadata_json;entered=threading.Event();release=threading.Event()
+    def reader(path,*args,**kwargs):
+        if Path(path)==marker and threading.current_thread().name.startswith('older'):
+            entered.set();assert release.wait(5);raise PermissionError('older authoritative lifecycle read')
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(module,'read_metadata_json',reader)
+    with ThreadPoolExecutor(max_workers=1,thread_name_prefix='older') as pool:
+        older=pool.submit(inbox.drain);assert entered.wait(5)
+        metadata.write_text(json.dumps({'working_dir':c.get(uri)['workingDirectory'],'name':'Newer successful title','turn_count':1}))
+        newer=other.drain();before=c.get(uri)['title'];release.set();old_result=older.result(timeout=5)
+    report={'newer':newer,'older':old_result,'beforeOlderCompletion':before,'afterOlderCompletion':c.get(uri)['title'],'remainingClaims':len(list(inbox.directory.iterdir()))}
+    inbox.close();other.close()
+    assert c.get(uri)['title']=='Newer successful title',report
+    assert newer['processed']==1 and old_result['failed']==1 and report['remainingClaims']==0
