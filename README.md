@@ -392,3 +392,60 @@ The host composes the projection with this explicit handshake:
 This component does not implement that host fence or snapshot authority. The host
 integration must qualify index loss, interrupted rebuild, restart, and concurrent
 reset/restore admission before enabling the product reset control.
+
+### Selected native family repair and verification (v1)
+
+`reconcileFamily({parentUri,limit:100,maxEntries:512})` is a trusted optional
+metadata-only repair for an explicitly selected family. Limits accept 1–100 and
+1–512 respectively. It visits only configured native project namespaces of the
+selected indexed root and its known/newly indexed descendants. It does not run
+`scan`, read transcript/event bodies, start agents or change canonical files.
+A stale global scan timestamp is retained honestly in `freshness`; the new
+`familyDiscovery` proof is separate. Existing `descendants` remains index-only.
+
+The result is the ordinary descendant envelope plus `familyDiscovery` with:
+`version:1`, `scope:'selected-native-project-namespaces'`, `phase:'complete'|'refused'`,
+`issues`, `completedAt`, `indexRevision`, `inventoryHash`, `namespaces`,
+`entriesExamined`, `metadataReads`, `metadataBytesAdmitted`, `maxEntries`,
+`metadataByteLimit:8388608`, `metadataFileLimit:4*maxEntries`, and
+`externalWriterCoverage:false`, `transcriptBodiesRead:false`,
+`nativeOwnershipVerified:false`. Complete proofs also have `verificationToken`.
+The proof's `indexRevision` equals the returned pure indexed `revision`.
+
+All directory entries count against the aggregate inventory bound, including
+lock/temp files. Metadata size admission is capped at 8 MiB across visited
+namespaces; file reads may count up to 2,048 at 512 entries. At most 16 configured
+native homes and 16 adapter homes are supported by this bounded operation.
+Source ambiguity, noncanonical identity, missing files, unsafe/special metadata,
+entry/byte limits, unfinished metadata, cycles/overflow, concurrent discovery or
+changed namespace facts refuse scoped coverage. Native metadata opens use
+nonblocking descriptors so a replacement FIFO cannot block opening. A five-second
+budget is checked between operations; filesystem call latency is not a hard
+real-time guarantee. Index repair may be partial on refusal; no complete proof
+or canonical effect is claimed.
+
+`verifyFamily({parentUri,verificationToken})` performs a bounded passive index and
+physical namespace/stat recheck. It neither repairs the index nor reads native
+file bodies. It returns `{version:1,scope:'selected-native-project-namespaces',
+parentUri,valid,issues,completedAt,externalWriterCoverage:false,
+nativeOwnershipVerified:false,transcriptBodiesRead:false,indexRevision?,inventoryHash?}`.
+Found tokens echo the original revision/hash; unknown, expired or mismatched
+ones refuse. Tokens expire after 300 seconds, are process-local, and occupy at
+most 64 retained inventories. Restart requires a fresh explicit reconciliation.
+
+A consumer holds its source admission, validates all ordinary family/root/parent
+identity and bound checks, then accepts scoped freshness only from a complete,
+issue-free v1 proof with exact `indexRevision===family.revision`. Under its
+existing child/native ownership leases it must call `verifyFamily`, require
+`valid:true`, exact parent/revision/hash, fresh timestamp and empty issues, then
+repeat pure `descendants` revision comparison before native dispatch. A new native
+child without a writer hint can leave the pure index revision unchanged; the
+physical verifier must refuse that race. Do not automatically repair/retry copy
+on verification refusal or replay unknown work.
+
+This proves selected known namespaces, not all native storage or exclusion of
+noncooperating external writers/cross-namespace relationships. Actual native
+ownership and descendant equality remain mandatory. Namespace locators are
+trusted-host details, not client UI fields. Older producers without these optional
+methods retain the prior fresh-global-index path; a supported refused/failed repair
+must never silently fall back to an old global timestamp.

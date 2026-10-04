@@ -20,7 +20,7 @@ class Server:
         self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
-                        "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
+                        "verifyFamily": discovery.verify_family, "reconcileFamily": discovery.reconcile_family, "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
                         "projectSessionVisibility": catalog.project_session_visibility,
                         "sessionVisibilityProjectionStatus": catalog.session_visibility_projection_status,
                         "sessionVisibilityProjectionReceipt": catalog.session_visibility_projection_receipt,
