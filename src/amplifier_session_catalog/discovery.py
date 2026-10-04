@@ -13,6 +13,14 @@ import uuid
 
 from .catalog import Catalog, directory_status, iso, timestamp, managed_location, managed_root
 
+class MetadataReadChanged(ValueError):
+    """Typed transient descriptor race; public validation remains compatible."""
+
+
+class RetryableHint(OSError):
+    """Private inbox outcome; keep the immutable claim for another bounded pass."""
+
+
 MAX_METADATA = 8 * 1024 * 1024
 METADATA = ("metadata.json", "metadata.json.backup", "naming.json", "context-intelligence/metadata.json")
 FIELDS = {"name", "title", "description", "bundle", "bundle_name", "parent_id", "parent_session_id",
@@ -63,7 +71,7 @@ def read_metadata_json(path, maximum=MAX_METADATA, *, admit=None):
         data = stream.read(info.st_size)
         after = os.fstat(stream.fileno())
         if len(data) != info.st_size or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            raise ValueError("Native metadata changed during read")
+            raise MetadataReadChanged("Native metadata changed during read")
     value = json.loads(data)
     if not isinstance(value, dict):
         raise ValueError("Native metadata must be an object")
@@ -125,6 +133,13 @@ class Discovery:
 
     def hint(self, sessionDirectory, *, run=None, force=False, _read_json=None):
         """Read current facts after a writer hint; never trust hinted metadata."""
+        return self._hint(sessionDirectory, run=run, force=force, _read_json=_read_json)
+
+    def _hint_for_inbox(self, sessionDirectory):
+        # Not registered as RPC. Public hints retain their existing result shape.
+        return self._hint(sessionDirectory, retry_transient=True)
+
+    def _hint(self, sessionDirectory, *, run=None, force=False, _read_json=None, retry_transient=False):
         home, project, identity = self._validate_directory(sessionDirectory)
         directory = Path(sessionDirectory).expanduser().absolute()
         previous = self.catalog.by_storage(directory)
@@ -142,6 +157,7 @@ class Discovery:
                     return True
                 return False
             changed = self.catalog._observe_source_presence(record, missing=True, confirm=absent)
+            if not changed and retry_transient:raise RetryableHint('Selected source changed during absence observation')
             return {'uri': record['uri'], 'changed': changed, 'issues': [] if changed else ['Native source changed during absence observation']}
         if not stat.S_ISDIR(directory_info.st_mode):
             raise ValueError('Native source directory must be a nonsymlink directory')
@@ -157,6 +173,7 @@ class Discovery:
                 self.catalog.touch_seen(previous["uri"], run)
             return {"uri": previous["uri"], "changed": False}
         native, capture, naming, issues = {}, {}, {}, []
+        transient_native = False
         def read_json(path, maximum=MAX_METADATA):
             def count(_path, _info):
                 self.metadata_reads += 1
@@ -178,7 +195,15 @@ class Discovery:
                 else:
                     capture = data
             except (OSError, ValueError, RecursionError) as exc:
-                issues.append(f"{name}: {type(exc).__name__}")
+                if i in (0,1) and isinstance(exc,(OSError,MetadataReadChanged)):
+                    transient_native = True
+                # Keep public diagnostic wording compatible for descriptor races.
+                category='ValueError' if isinstance(exc,MetadataReadChanged) else type(exc).__name__
+                issues.append(f"{name}: {category}")
+        if retry_transient and transient_native and not native:
+            # Failed reads are not newer source facts. In particular, an older
+            # drainer must not downgrade a successful concurrent projection.
+            raise RetryableHint('Selected native metadata temporarily unavailable')
         if not native and not capture:
             if previous:
                 record = self.catalog.get(previous["uri"])
@@ -251,6 +276,7 @@ class Discovery:
         if issues:
             record["reason"] = "; ".join(issues)[:8192]
         confirmations=[]
+        transient_lifecycle=False
         for path, stamp in zip(markers, marker_stamps):
             if not stamp: continue
             try:
@@ -262,18 +288,25 @@ class Discovery:
                 if type(marker.get("deleted")) is not bool or not isinstance(marker.get("commandId"),str) or not 1 <= len(marker["commandId"]) <= 200:
                     raise ValueError("Invalid native lifecycle marker proof")
                 confirmations.append({"deleted":marker["deleted"], "commandId":marker["commandId"], "evidence":"configured-native-marker"})
-            except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+                if isinstance(exc,(OSError,MetadataReadChanged)):transient_lifecycle=True
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
-        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
+        retry_required=retry_transient and transient_lifecycle
+        if retry_required:confirmation=None
+        # A provisional projection cannot cache a failed authoritative read as
+        # complete; unchanged source stamps must still retry on the next pass.
+        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=None if retry_required else fingerprint, seen_run=run, confirmed_visibility=confirmation,
                             native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
         if native and not issues and previous and previous.get("source_missing"):
             def present():
                 self._validate_directory(directory)
                 current = directory.stat(follow_symlinks=False)
                 return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (directory_info.st_dev, directory_info.st_ino) and [file_stamp(directory/name) for name in METADATA] == stamps
-            self.catalog._observe_source_presence({**record, 'uri': indexed['uri']}, missing=False, confirm=present)
+            restored=self.catalog._observe_source_presence({**record, 'uri': indexed['uri']}, missing=False, confirm=present)
+            if not restored and retry_transient:raise RetryableHint('Selected source changed during presence restoration')
+        if retry_required:raise RetryableHint('Selected authoritative metadata temporarily unavailable')
         return {"uri": uri, "changed": True, "issues": issues}
 
     def _family_inventory(self, namespace, budget):

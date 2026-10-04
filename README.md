@@ -176,7 +176,18 @@ The consumer atomically claims a notice under `<hash>.processing-<32 hex chars>`
 before reading it, so a later writer's notice cannot be deleted by the old consumer.
 Crash claims are rediscovered. Invalid versions, filenames, roots, special files,
 symlinks, and oversized records are rejected; transient index/I/O failures retain the
-claim for a later batch. Every accepted location passes through `Discovery.hint`'s
+claim for a later batch. A private discovery adapter also retains a claim when
+native metadata admission or authoritative lifecycle reads fail with typed transient
+I/O/descriptor races, or a selected-source presence confirmation changes mid-check.
+Public `hint` results and notice fields are unchanged. A failed native read does
+not overwrite indexed metadata from another successful drainer. Partial lifecycle
+proofs do not change native visibility while an owner source is unreadable; any
+provisional valid metadata projection leaves its fingerprint uncached for retry.
+Current valid native/backup metadata with optional naming/capture failures remains
+accepted. Malformed or missing native metadata alone is not a transient signal;
+malformed notices, unsafe paths and unconfigured roots remain rejected. Persistent
+failures occupy bounded claims and bounded passes, with no scan, worker start or
+history body read. Every accepted location passes through `Discovery.hint`'s
 configured native-root and metadata validation. Native events/transcripts are never
 opened by hint processing (transcript stat remains part of change detection).
 
