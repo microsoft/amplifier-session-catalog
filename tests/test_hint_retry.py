@@ -161,15 +161,15 @@ def test_failed_restore_confirmation_retains_notice_until_exact_metadata_recheck
     import shutil
     c,d,inbox,directory=fixture(tmp_path);uri=d.hint(str(directory))['uri'];metadata=(directory/'metadata.json').read_bytes();shutil.rmtree(directory);d.hint(str(directory))
     directory.mkdir();(directory/'metadata.json').write_bytes(metadata);(directory/'transcript.jsonl').write_bytes(b'opaque')
-    original=c._observe_source_presence;once=True
+    original=c._publish_discovery;once=True
     def replaced(record,**kwargs):
         nonlocal once
-        if not kwargs['missing'] and once:
+        if kwargs.get('restore_presence') and once:
             once=False;directory.rename(directory.with_name('old'));directory.mkdir();(directory/'metadata.json').write_bytes(metadata);(directory/'transcript.jsonl').write_bytes(b'opaque')
         return original(record,**kwargs)
-    monkeypatch.setattr(c,'_observe_source_presence',replaced)
-    assert inbox.drain()['failed']==1 and not c.list(connectionId='restore-race')['items'];inbox.close()
-    assert inbox.drain()['processed']==1 and c.get(uri)['availability']=='available';inbox.close()
+    monkeypatch.setattr(c,'_publish_discovery',replaced)
+    assert inbox.drain()['processed']==1 and c.get(uri)['availability']=='available'
+    assert not list(inbox.directory.iterdir());inbox.close()
 
 
 def test_unconfigured_and_malformed_wire_poison_remain_rejected(tmp_path):

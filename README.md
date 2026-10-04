@@ -522,3 +522,32 @@ locations before exposing reconstructed work. Global scans do not invent tombsto
 for unvisited directories. This rule does not remove drafts, receipts, accepted work
 or canonical history and does not authorize a native delete. A CLI delete notice
 producer remains a separate integration; post-save notices require existing sources.
+
+
+## Selected-source publication CAS
+
+Discovery captures one exact indexed source row, including its native visibility
+state, before reading metadata. Its private publisher compares that row token under
+the existing SQLite writer transaction and confirms the selected directory identity
+and current file read set before applying metadata or lifecycle proof. The file
+facts include device, inode, size, mtime and ctime for four metadata locations, two
+transcript stat locations and at most sixteen configured lifecycle locations. No
+transcript/event body is opened. Larger adapter sets refuse before metadata opens.
+A stale successful reader therefore cannot overwrite a newer completed projection.
+No application-wide read lock or global filesystem scan is added.
+
+Selected directory absence uses the same row comparison plus repeated ENOENT;
+metadata restoration and clearing exact derived absence occur in the same guarded
+publication transaction. Native deletion, product/workspace exclusion, archive
+flags and canonical history remain independent. Indexed ambiguity, a different
+native binding, unsafe files or unknown I/O do not authorize replacement.
+
+Public `hint` retains its result shape and reports changed-false with issues when
+publication races. The private inbox adapter permits at most one fresh selected
+attempt after a publication conflict (two total), so a newer candidate can recover
+when a successful competing drainer acknowledged their shared claim. Persistent
+conflicts keep the immutable claim for a later bounded pass. Transient native or
+lifecycle read failures still return before publication and wait for a later batch;
+accepted usable partial metadata and malformed/unsafe/unconfigured poison treatment
+remain unchanged. All publication hooks and row tokens are private, unregistered
+implementation details; public upsert and notice fields do not expand.
