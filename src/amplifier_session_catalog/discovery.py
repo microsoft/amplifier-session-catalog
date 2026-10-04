@@ -128,6 +128,23 @@ class Discovery:
         home, project, identity = self._validate_directory(sessionDirectory)
         directory = Path(sessionDirectory).expanduser().absolute()
         previous = self.catalog.by_storage(directory)
+        try:
+            directory_info = directory.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            record = self.catalog.get(previous['uri']) if previous else None
+            if not record or record.get('storagePath') != str(directory) or record['engineId'] != self.engine_id or record['nativeSessionId'] != identity or project_slug(record['workingDirectory']) != project:
+                return {'changed': False, 'issues': ['Native source directory is missing or not exactly indexed']}
+            def absent():
+                self._validate_directory(directory)
+                try:
+                    directory.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    return True
+                return False
+            changed = self.catalog._observe_source_presence(record, missing=True, confirm=absent)
+            return {'uri': record['uri'], 'changed': changed, 'issues': [] if changed else ['Native source changed during absence observation']}
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise ValueError('Native source directory must be a nonsymlink directory')
         stamps = [file_stamp(directory / name) for name in METADATA]
         transcript = file_stamp(directory / "transcript.jsonl") or file_stamp(directory / "transcript.jsonl.backup")
         markers = [(root / "sessions" / identity / "lifecycle.json") for root in self.app_homes]
@@ -135,7 +152,7 @@ class Discovery:
         # A derived-index upgrade must rebuild native parent evidence even when
         # canonical file stamps have not changed since the prior scanner version.
         fingerprint = hashlib.sha256(json.dumps(['native-parent-v1',stamps, transcript, marker_stamps]).encode()).hexdigest()
-        if previous and previous["fingerprint"] == fingerprint and not force:
+        if previous and previous["fingerprint"] == fingerprint and not force and not previous.get("source_missing"):
             if run:
                 self.catalog.touch_seen(previous["uri"], run)
             return {"uri": previous["uri"], "changed": False}
@@ -249,8 +266,14 @@ class Discovery:
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
-        self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
+        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
                             native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
+        if native and not issues and previous and previous.get("source_missing"):
+            def present():
+                self._validate_directory(directory)
+                current = directory.stat(follow_symlinks=False)
+                return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (directory_info.st_dev, directory_info.st_ino) and [file_stamp(directory/name) for name in METADATA] == stamps
+            self.catalog._observe_source_presence({**record, 'uri': indexed['uri']}, missing=False, confirm=present)
         return {"uri": uri, "changed": True, "issues": issues}
 
     def _family_inventory(self, namespace, budget):

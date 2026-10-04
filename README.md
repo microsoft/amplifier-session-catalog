@@ -478,3 +478,32 @@ ownership and descendant equality remain mandatory. Namespace locators are
 trusted-host details, not client UI fields. Older producers without these optional
 methods retain the prior fresh-global-index path; a supported refused/failed repair
 must never silently fall back to an old global timestamp.
+
+
+## Reversible selected-source absence
+
+A location hint for an already indexed exact native directory under a configured
+home may observe `ENOENT`. Discovery repeats that check and verifies the indexed
+URI, engine, native identity, workspace and exact storage path under the index
+writer transaction. It then records internal source absence and excludes that row
+from normal root/child pages and retention candidates before pagination. This is
+neither `nativeDeleted` nor `productHidden`; those independent owner flags remain
+unchanged. No public field, hint shape or availability enum is added.
+
+Exact authorized `get`, safety descendants and directory-use retain the historical
+row and relationships, with `read-only` availability. Explicit `includeArchive`
+historical pages may still show the retained row. Present directories with missing
+or invalid metadata, permission/IO errors, symlinks, foreign roots and changed
+bindings do not prove physical absence. No history body is read and no worker or
+model is started. Work is bounded to the selected path and its indexed row.
+
+Only a successful current metadata refresh at the same validated physical directory
+can clear its internal absence observation. Native deletion, product exclusion and
+workspace exclusion still dominate. Ordinary upsert, native/product restore,
+workspace recheck and process restart cannot silently clear absence. The durable
+index preserves observations across restart. A destroyed index loses this derived
+state; hosts must retain their existing rebuild fence and reobserve known selected
+locations before exposing reconstructed work. Global scans do not invent tombstones
+for unvisited directories. This rule does not remove drafts, receipts, accepted work
+or canonical history and does not authorize a native delete. A CLI delete notice
+producer remains a separate integration; post-save notices require existing sources.

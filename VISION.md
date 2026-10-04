@@ -20,7 +20,7 @@ The catalog is independently usable; it must not depend on Unified runtime objec
 
 The catalog owns rebuildable metadata indexes, workspace-existence observations,
 parent mapping, bounded location-only writer hints, paged discovery and derived
-visibility projections. Native adapters own canonical history and writable execution
+visibility projections, including reversible exact selected-source absence. Native adapters own canonical history and writable execution
 identity. Hosts own authorization, execution/admission receipts, product reset
 eligibility, retained undo and rebuild readiness. Clients own drafts and selection.
 

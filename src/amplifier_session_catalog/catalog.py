@@ -151,6 +151,10 @@ class Catalog:
                 CREATE TABLE IF NOT EXISTS managed_locations(uri TEXT PRIMARY KEY,workspace TEXT NOT NULL,root TEXT NOT NULL,location TEXT NOT NULL,source TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS managed_workspace ON managed_locations(workspace,uri);
                 CREATE INDEX IF NOT EXISTS managed_roots ON managed_locations(root,uri);
+                CREATE TABLE IF NOT EXISTS source_presence (
+                    uri TEXT NOT NULL, storage_path TEXT NOT NULL, missing INTEGER NOT NULL CHECK(missing=1),
+                    PRIMARY KEY(uri,storage_path)
+                );
                 CREATE TABLE IF NOT EXISTS native_visibility (uri TEXT PRIMARY KEY, deleted INTEGER NOT NULL, command_id TEXT NOT NULL, evidence TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS product_visibility (
                     uri TEXT PRIMARY KEY, source TEXT NOT NULL, hidden INTEGER NOT NULL CHECK(hidden IN (0,1)), revision INTEGER NOT NULL
@@ -164,7 +168,7 @@ class Catalog:
                 CREATE TRIGGER workspace_visibility AFTER UPDATE OF availability ON workspaces
                     WHEN OLD.availability <> NEW.availability BEGIN
                     UPDATE workspace_index SET availability=NEW.availability WHERE path=NEW.path;
-                    UPDATE sessions SET visible=(NEW.availability='present' AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1)) WHERE workspace=NEW.path;
+                    UPDATE sessions SET visible=(NEW.availability='present' AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=NEW.path AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1)) WHERE workspace=NEW.path;
                 END;
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
@@ -320,8 +324,13 @@ class Catalog:
                 db.execute("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",(uri,int(archive)))
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
+            source_missing = db.execute('SELECT 1 FROM source_presence WHERE uri=? AND storage_path=? AND missing=1',(uri,storage)).fetchone()
+            if source_missing:
+                availability='read-only';details['reason']='Native source directory is unavailable'
+                raw=json.dumps(details,ensure_ascii=False)
+                if len(raw.encode())>32768:raise ValueError('Catalog details exceed 32 KiB')
             visible = db.execute("SELECT availability='present' FROM workspaces WHERE path=?", (workspace,)).fetchone()[0]
-            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or db.execute("SELECT 1 FROM product_visibility WHERE uri=? AND hidden=1", (uri,)).fetchone() or not location and db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
+            if db.execute("SELECT 1 FROM native_visibility WHERE uri=? AND deleted=1", (uri,)).fetchone() or db.execute("SELECT 1 FROM product_visibility WHERE uri=? AND hidden=1", (uri,)).fetchone() or source_missing or not location and db.execute("SELECT 1 FROM workspace_index WHERE path=? AND hidden=1",(workspace,)).fetchone(): visible = 0
             db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uri) DO UPDATE SET engine=excluded.engine,native_id=excluded.native_id,
                 workspace=excluded.workspace,parent_uri=excluded.parent_uri,kind=excluded.kind,
@@ -339,6 +348,43 @@ class Catalog:
                 db.execute('DELETE FROM native_parent_links WHERE uri=?',(uri,))
             self._resolve_native_parents(db,engine,native,workspace)
         return self.get(uri)
+
+    def _observe_source_presence(self, record, *, missing, confirm):
+        """Discovery-only exact binding CAS; never native deletion authority.
+
+        The caller confirms configured path facts again under the index writer
+        transaction. No public RPC may supply observations or clear this state.
+        """
+        storage=record.get('storagePath')
+        if not storage or not callable(confirm):
+            raise ValueError('Exact source observation required')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT * FROM sessions WHERE uri=?',(record['uri'],)).fetchone()
+            if not row or (row['engine'],row['native_id'],row['workspace'],row['storage_path']) != (record['engineId'],record['nativeSessionId'],record['workingDirectory'],storage) or not confirm():
+                return False
+            if missing:
+                details=json.loads(row['details']);details['reason']='Native source directory is unavailable'
+                raw=json.dumps(details,ensure_ascii=False)
+                if len(raw.encode())>32768:raise ValueError('Catalog details exceed 32 KiB')
+                db.execute('INSERT OR IGNORE INTO source_presence VALUES(?,?,1)',(row['uri'],storage))
+                db.execute("UPDATE sessions SET visible=0,availability='read-only',fingerprint=NULL,details=? WHERE uri=?",(raw,row['uri']))
+            else:
+                # A successful exact metadata refresh may restore presence only.
+                # Keep independent native/product/workspace exclusions dominant.
+                db.execute('DELETE FROM source_presence WHERE uri=? AND storage_path=?',(row['uri'],storage))
+                details=json.loads(row['details'])
+                if record.get('reason'):details['reason']=record['reason']
+                else:details.pop('reason',None)
+                db.execute("""UPDATE sessions SET availability=?,details=?,visible=(
+                    EXISTS(SELECT 1 FROM workspaces w WHERE w.path=sessions.workspace AND w.availability='present')
+                    AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri)
+                         OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=sessions.workspace AND wi.hidden=1))
+                    AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)
+                    AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1)
+                    AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1))
+                    WHERE uri=?""",(record.get('availability','available'),json.dumps(details),row['uri']))
+            return True
 
     def claim_native(self, *, record, commandId, evidence):
         """Atomic derived registration after the host verifies native authority.
@@ -450,8 +496,8 @@ class Catalog:
                     AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present')
                     AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri)
                         OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))
-                    AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1))
-                    WHERE uri=?""", (hidden, uri))
+                    AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1)
+                    AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1)) WHERE uri=?""", (hidden, uri))
             db.execute('INSERT INTO product_visibility_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision',
                        (source, throughRevision))
             db.execute('INSERT INTO product_visibility_commands VALUES(?,?,?,?)',
@@ -470,7 +516,7 @@ class Catalog:
             raise ValueError("Confirmed native visibility evidence required")
         with self.connect() as db:
             db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(deleted), commandId, evidence))
-            db.execute("UPDATE sessions SET visible=(?=0 AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1))) WHERE uri=?", (int(deleted), uri))
+            db.execute("UPDATE sessions SET visible=(?=0 AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND EXISTS(SELECT 1 FROM workspaces WHERE path=workspace AND availability='present') AND (EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=sessions.uri) OR NOT EXISTS(SELECT 1 FROM workspace_index wi WHERE wi.path=workspace AND wi.hidden=1)) AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1)) WHERE uri=?", (int(deleted), uri))
         return {"uri": uri, "deleted": deleted, "commandId": commandId}
 
     @staticmethod
@@ -547,7 +593,7 @@ class Catalog:
                 db.execute("INSERT INTO workspaces VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability,checked_at=excluded.checked_at",(path,availability,time.time()))
                 db.execute("INSERT INTO workspace_index VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,availability=excluded.availability,registered=excluded.registered,hidden=excluded.hidden,revision=excluded.revision,source=excluded.source",(path,row['id'],name,name.casefold(),availability,int(row['registered']),int(row['hidden']),revision,source))
                 if bool(known['hidden'] if known else False)!=row['hidden']:
-                    db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
+                    db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
             db.execute("INSERT INTO workspace_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision",(source,throughRevision))
         return {"source":source,"revision":throughRevision,"projected":len(records)}
 
@@ -576,7 +622,7 @@ class Catalog:
 
     def by_storage(self, path):
         with self.connect() as db:
-            row = db.execute("SELECT uri,fingerprint FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
+            row = db.execute("SELECT uri,fingerprint,EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1) AS source_missing FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
         return dict(row) if row else None
 
     def directory_in_use(self, *, path):
