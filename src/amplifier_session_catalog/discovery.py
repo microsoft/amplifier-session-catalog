@@ -549,6 +549,7 @@ class Discovery:
     def _project_directories(self, home):
         projects = home / "projects"
         observation = "native-projects:" + str(home)
+        declared_empty = "initially-empty-projects:" + str(home)
         try:
             with os.scandir(projects) as entries:
                 # Private derived evidence also remembers an observed empty root.
@@ -568,11 +569,15 @@ class Discovery:
                 prefix = str(projects) + os.sep
                 upper = str(projects) + chr(ord(os.sep) + 1)
                 with self.catalog.connect() as db:
+                    prior_success = db.execute("SELECT 1 FROM progress WHERE key='discovery-success'").fetchone()
+                    prior_declaration = db.execute("SELECT 1 FROM progress WHERE key=?", (declared_empty,)).fetchone()
                     known = (db.execute("SELECT 1 FROM progress WHERE key=?", (observation,)).fetchone()
                              or db.execute("SELECT 1 FROM sessions WHERE source=? LIMIT 1", ("native:" + str(home),)).fetchone()
-                             or db.execute("SELECT 1 FROM sessions WHERE storage_path>=? AND storage_path<? LIMIT 1", (prefix, upper)).fetchone())
-                if home in self.initially_empty_homes and not known:
-                    return
+                             or db.execute("SELECT 1 FROM sessions WHERE storage_path>=? AND storage_path<? LIMIT 1", (prefix, upper)).fetchone()
+                             or prior_success and not prior_declaration)
+                    if home in self.initially_empty_homes and not known:
+                        db.execute("INSERT OR IGNORE INTO progress VALUES(?,?)", (declared_empty, '{"declared":true}'))
+                        return
             raise
 
     def scan(self):
@@ -582,8 +587,14 @@ class Discovery:
         state = {"phase": "running", "runId": run, "projects": 0, "sessions": 0,
                  "changed": 0, "issues": 0, "metadataReads": 0, "startedAt": iso(time.time())}
         initial_reads = self.metadata_reads
-        self.catalog.progress(state)
         try:
+            previous = self.catalog.progress()
+            if previous.get("phase") == "complete" and previous.get("issues") == 0:
+                # Legacy progress has no per-home observations. Keep its
+                # successful discovery evidence before replacing live status.
+                with self.catalog.connect() as db:
+                    db.execute("INSERT OR IGNORE INTO progress VALUES('discovery-success',?)", ('{"observed":true}',))
+            self.catalog.progress(state)
             for home in self.homes:
                 if self.stop.is_set():
                     break

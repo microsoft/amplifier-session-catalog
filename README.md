@@ -47,6 +47,10 @@ sources or host storage mappings keep missing-root failures even with the declar
 non-directory, dangling-link and corrupt-metadata failures remain issues. Symlink,
 noncanonical, missing, non-directory or unconfigured declared homes are rejected.
 Private namespace observations are rebuildable index state, not native authority.
+A successful legacy scan has no per-home observations, so its retained completion
+conservatively prevents a new empty-home declaration from excusing missing roots.
+Accepted first-run empty declarations are remembered separately, permitting their
+repeated scans while prior namespace observations and indexed history still win.
 A caller must not declare a retained or index-loss recovery home fresh: history
 lost before any retained catalog observation cannot be distinguished from first
 use by the index alone.

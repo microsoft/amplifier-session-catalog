@@ -123,3 +123,23 @@ def test_cli_fresh_declaration_is_explicit_repeatable_and_scoped(tmp_path):
     assert json.loads(opted.stdout)['issues']==0 and all(not (home/'projects').exists() for home in homes)
     bad=subprocess.run(command+['--initially-empty-home',str(tmp_path/'unconfigured')],text=True,capture_output=True)
     assert bad.returncode!=0 and 'configured canonical existing directory' in bad.stderr
+
+
+def test_legacy_successful_empty_scan_refuses_missing_root_across_retries(tmp_path):
+    home=tmp_path/'home';projects=home/'projects';projects.mkdir(parents=True)
+    catalog=Catalog(tmp_path/'index.sqlite')
+    # Predecessor progress is the only durable evidence for its empty scan.
+    catalog.progress({'phase':'complete','runId':'legacy-empty','projects':0,
+                      'sessions':0,'changed':0,'issues':0,'metadataReads':0})
+    projects.rmdir()
+    for _ in range(2):
+        catalog=Catalog(catalog.path)
+        assert Discovery(catalog,[home],initially_empty_homes=[home]).scan()['issues']==1
+        assert not projects.exists()
+
+
+def test_fresh_empty_declaration_survives_unrelated_failed_scan_and_restart(tmp_path):
+    home=tmp_path/'home';home.mkdir();catalog=Catalog(tmp_path/'index.sqlite')
+    assert Discovery(catalog,[home],initially_empty_homes=[home]).scan()['issues']==0
+    assert Discovery(catalog,[tmp_path/'missing']).scan()['issues']==1
+    assert Discovery(Catalog(catalog.path),[home],initially_empty_homes=[home]).scan()['issues']==0
