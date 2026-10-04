@@ -74,7 +74,8 @@ class HintInbox:
                     raise ValueError("Hint filename does not match its location")
                 # Same public contract used by ACP writer notifications. This
                 # validates native roots and reads bounded metadata, never events.
-                self.discovery.hint(sessionDirectory=value["sessionDirectory"])
+                hint=getattr(self.discovery,'_hint_for_inbox',self.discovery.hint)
+                hint(sessionDirectory=value["sessionDirectory"])
                 claim.unlink(missing_ok=True)
                 result["processed"] += 1
             except FileNotFoundError:
