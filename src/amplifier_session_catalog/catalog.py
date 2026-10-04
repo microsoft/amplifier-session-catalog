@@ -143,6 +143,7 @@ class Catalog:
                 CREATE INDEX IF NOT EXISTS visible_roots_order ON sessions(visible, kind, modified_at DESC, uri);
                 CREATE INDEX IF NOT EXISTS workspace_order ON sessions(workspace, kind, modified_at DESC, uri);
                 CREATE INDEX IF NOT EXISTS parent_order ON sessions(parent_uri, modified_at DESC, uri);
+                CREATE INDEX IF NOT EXISTS visible_parent_order ON sessions(visible, parent_uri, kind, modified_at DESC, uri);
                 CREATE INDEX IF NOT EXISTS storage_lookup ON sessions(storage_path);
                 CREATE INDEX IF NOT EXISTS native_lookup ON sessions(engine, native_id, workspace);
                 CREATE TABLE IF NOT EXISTS native_parent_links(uri TEXT PRIMARY KEY,engine TEXT NOT NULL,parent_native_id TEXT NOT NULL,workspace TEXT NOT NULL,parent_storage TEXT NOT NULL,fallback_uri TEXT NOT NULL,state TEXT NOT NULL);
