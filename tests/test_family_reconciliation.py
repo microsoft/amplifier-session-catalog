@@ -164,3 +164,122 @@ def test_physical_metadata_change_expiry_restart_and_token_target_refuse(tmp_pat
     assert not discovery.verify_family(parentUri=uri,verificationToken=token)['valid']
     discovery._family_proofs[token]['expires']=time.monotonic()-1
     assert 'unknown-expired-or-mismatched-family-proof' in discovery.verify_family(parentUri=uri,verificationToken=token)['issues']
+
+
+def marker_fixture(discovery, tmp_path, workspace, identity='parent', homes=1, padding=0, deleted=True):
+    discovery.app_homes = tuple(tmp_path/f'app-{n}' for n in range(homes))
+    markers=[]
+    for app in discovery.app_homes:
+        marker=app/'sessions'/identity/'lifecycle.json';marker.parent.mkdir(parents=True,exist_ok=True)
+        marker.write_text(json.dumps({'sessionId':identity,'historyCwd':str(workspace),'deleted':deleted,'commandId':'native-lifecycle','padding':'x'*padding}))
+        markers.append(marker)
+    return markers
+
+
+def test_all_adapter_lifecycle_reads_share_file_and_byte_admission(tmp_path,monkeypatch):
+    _,discovery,uri,_,native,workspace,_=fixture(tmp_path)
+    for n in range(8):native(f'child-{n}','parent')
+    for identity in ['parent', *[f'child-{n}' for n in range(8)]]:
+        marker_fixture(discovery,tmp_path,workspace,identity,homes=16,padding=60000)
+    # Installed-review counterexample: 9 native +144 lifecycle files exceeded
+    # both declared budgets while the predecessor incorrectly returned complete.
+    original=os.open;source_opens=[]
+    def opened(path,*args,**kwargs):
+        if Path(path).name in {'metadata.json','lifecycle.json'}:source_opens.append(path)
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(os,'open',opened)
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=9)['familyDiscovery']
+    assert proof['phase']=='refused' and 'metadata-byte-limit' in proof['issues']
+    assert proof['metadataReads']==proof['metadataBytesAdmitted']==0 and not source_opens
+    for marker in tmp_path.glob('app-*/sessions/*/lifecycle.json'):
+        value=json.loads(marker.read_text());value['padding']='';marker.write_text(json.dumps(value))
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=9)['familyDiscovery']
+    assert proof['phase']=='refused' and 'metadata-file-limit' in proof['issues']
+    assert proof['metadataReads']==0 and not source_opens
+
+
+@pytest.mark.parametrize('mutation',['change','remove','new'])
+def test_lifecycle_inventory_is_verified_without_body_reads(tmp_path,monkeypatch,mutation):
+    catalog,discovery,uri,sessions,_,workspace,_=fixture(tmp_path)
+    markers=marker_fixture(discovery,tmp_path,workspace,homes=2)
+    if mutation=='new':markers[1].unlink()
+    before={path:path.read_bytes() for path in [sessions/'parent'/'metadata.json',sessions/'parent'/'transcript.jsonl',markers[0]]}
+    result=discovery.reconcile_family(parentUri=uri,maxEntries=1);proof=result['familyDiscovery']
+    assert proof['phase']=='complete' and proof['metadataReads']==(2 if mutation=='new' else 3)
+    assert proof['metadataBytesAdmitted']==sum(len(path.read_bytes()) for path in [sessions/'parent'/'metadata.json',*markers] if path.exists())
+    assert catalog.get(uri)['nativeDeleted'] and not catalog.list(connectionId='a')['items']
+    assert {path:path.read_bytes() for path in before}==before
+    if mutation=='change':markers[0].write_text(markers[0].read_text()+' ')
+    elif mutation=='remove':markers[0].unlink()
+    else:markers[1].write_text(markers[0].read_text())
+    assert catalog.descendants(parentUri=uri)['revision']==proof['indexRevision']
+    original=os.open
+    def no_body(path,*args,**kwargs):
+        assert Path(path).name not in {'metadata.json','lifecycle.json','transcript.jsonl'}
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(os,'open',no_body)
+    assert not discovery.verify_family(parentUri=uri,verificationToken=proof['verificationToken'])['valid']
+
+
+def test_lifecycle_fifo_replacement_after_stat_is_nonblocking(tmp_path,monkeypatch):
+    _,discovery,uri,_,_,workspace,_=fixture(tmp_path)
+    marker=marker_fixture(discovery,tmp_path,workspace)[0]
+    original=os.open;flags_seen=[]
+    def replacement(path,flags,*args,**kwargs):
+        if Path(path)==marker:
+            flags_seen.append(flags)
+            # Assert before opening: a regression must fail instead of hanging.
+            assert flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW
+            marker.unlink();os.mkfifo(marker)
+        return original(path,flags,*args,**kwargs)
+    monkeypatch.setattr(os,'open',replacement)
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=1)['familyDiscovery']
+    assert flags_seen and proof['phase']=='refused' and proof['metadataReads']==1
+    assert proof['metadataBytesAdmitted']<proof['metadataByteLimit']
+
+
+def test_lifecycle_conflict_and_invalid_json_preserve_hidden_state_and_count_reads(tmp_path):
+    catalog,discovery,uri,_,_,workspace,_=fixture(tmp_path)
+    markers=marker_fixture(discovery,tmp_path,workspace,homes=2)
+    assert discovery.reconcile_family(parentUri=uri,maxEntries=1)['familyDiscovery']['phase']=='complete'
+    value=json.loads(markers[1].read_text());value.update(deleted=False,commandId='different');markers[1].write_text(json.dumps(value))
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=1)['familyDiscovery']
+    assert proof['phase']=='refused' and proof['metadataReads']==3 and catalog.get(uri)['nativeDeleted']
+    markers[1].write_text('{')
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=1)['familyDiscovery']
+    assert proof['phase']=='refused' and proof['metadataReads']==3 and catalog.get(uri)['nativeDeleted']
+
+
+def test_replacement_growth_is_refused_before_body_admission(tmp_path,monkeypatch):
+    _,discovery,uri,_,_,workspace,_=fixture(tmp_path)
+    marker=marker_fixture(discovery,tmp_path,workspace)[0]
+    original=os.open
+    def growth(path,flags,*args,**kwargs):
+        if Path(path)==marker:marker.write_text(marker.read_text()+' '*1000)
+        return original(path,flags,*args,**kwargs)
+    monkeypatch.setattr(os,'open',growth)
+    proof=discovery.reconcile_family(parentUri=uri,maxEntries=1)['familyDiscovery']
+    assert proof['phase']=='refused' and proof['metadataReads']==1
+
+
+def test_descriptor_growth_after_admission_never_reads_extra_bytes(tmp_path,monkeypatch):
+    from amplifier_session_catalog.discovery import read_metadata_json
+    path=tmp_path/'lifecycle.json';path.write_text('{}')
+    original=os.fdopen;read_sizes=[]
+    class Observed:
+        def __init__(self,stream):self.stream=stream
+        def __enter__(self):return self
+        def __exit__(self,*args):self.stream.close()
+        def fileno(self):return self.stream.fileno()
+        def read(self,size):
+            raw=self.stream.read(size);read_sizes.append((size,len(raw)));return raw
+    def unbuffered(fd,mode,**kwargs):
+        assert kwargs.get('buffering')==0
+        return Observed(original(fd,mode,**kwargs))
+    monkeypatch.setattr(os,'fdopen',unbuffered)
+    def grow(_path,info):
+        assert info.st_size==2
+        path.write_text('{}'+' '*10000)
+    with pytest.raises(ValueError,match='changed during read'):
+        read_metadata_json(path,admit=grow)
+    assert read_sizes==[(2,2)]

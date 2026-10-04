@@ -179,10 +179,10 @@ def test_hint_validates_root_and_never_reads_events(catalog, tmp_path, monkeypat
     import amplifier_session_catalog.discovery as module
     original = module.small_metadata
     reads = []
-    def inspect(path):
+    def inspect(path, **kwargs):
         reads.append(path.name)
         assert path.name not in {"transcript.jsonl", "events.jsonl"}
-        return original(path)
+        return original(path, **kwargs)
     monkeypatch.setattr(module, "small_metadata", inspect)
     d = Discovery(catalog, [home])
     assert d.hint(str(directory))["changed"]

@@ -50,18 +50,28 @@ def classify(identity, *sources):
     return ("child" if "_" in identity else "root"), None
 
 
-def small_metadata(path):
+def read_metadata_json(path, maximum=MAX_METADATA, *, admit=None):
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    with os.fdopen(fd, "rb") as stream:
+    with os.fdopen(fd, "rb", buffering=0) as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_METADATA:
-            raise ValueError("Native metadata must be a regular file of at most 8 MiB")
-        data = stream.read(MAX_METADATA + 1)
-        if len(data) > MAX_METADATA:
-            raise ValueError("Native metadata grew beyond the limit")
+        if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
+            raise ValueError("Native metadata must be a bounded regular file")
+        if admit is not None:
+            admit(Path(path), info)
+        # Admit the opened descriptor, not an earlier path stat. Never consume
+        # bytes beyond that admission, even if a concurrent writer grows it.
+        data = stream.read(info.st_size)
+        after = os.fstat(stream.fileno())
+        if len(data) != info.st_size or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("Native metadata changed during read")
     value = json.loads(data)
     if not isinstance(value, dict):
         raise ValueError("Native metadata must be an object")
+    return value
+
+
+def small_metadata(path, *, read_json=read_metadata_json):
+    value = read_json(path)
     result = {k: v for k, v in value.items() if k in FIELDS and (v is None or isinstance(v, (str, int, float, bool)))}
     if 'location' in value:
         try:result['location']=managed_location(value['location'])
@@ -113,7 +123,7 @@ class Discovery:
                 return home, parts[0], parts[2]
         raise ValueError("Session directory is outside configured native roots or uses a symlink")
 
-    def hint(self, sessionDirectory, *, run=None, force=False):
+    def hint(self, sessionDirectory, *, run=None, force=False, _read_json=None):
         """Read current facts after a writer hint; never trust hinted metadata."""
         home, project, identity = self._validate_directory(sessionDirectory)
         directory = Path(sessionDirectory).expanduser().absolute()
@@ -130,14 +140,18 @@ class Discovery:
                 self.catalog.touch_seen(previous["uri"], run)
             return {"uri": previous["uri"], "changed": False}
         native, capture, naming, issues = {}, {}, {}, []
+        def read_json(path, maximum=MAX_METADATA):
+            def count(_path, _info):
+                self.metadata_reads += 1
+            return (_read_json(path, maximum) if _read_json is not None
+                    else read_metadata_json(path, maximum, admit=count))
         for i, name in enumerate(METADATA):
             if not stamps[i]:
                 continue
             if i == 1 and native:
                 continue
             try:
-                data = small_metadata(directory / name)
-                self.metadata_reads += 1
+                data = small_metadata(directory / name, read_json=read_json)
                 if i in (0, 1):
                     native = data
                     if i == 1:
@@ -225,16 +239,13 @@ class Discovery:
             try:
                 if stamp[2] > 65536 or any(part.is_symlink() for part in (path, *path.parents)):
                     raise ValueError("Unsafe native lifecycle marker")
-                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                with os.fdopen(fd, "rb") as stream: raw = stream.read(65537)
-                if len(raw) > 65536: raise ValueError("Oversized lifecycle marker")
-                marker = json.loads(raw)
+                marker = read_json(path, 65536)
                 if marker.get("sessionId") != identity or marker.get("historyCwd") != workspace:
                     raise ValueError("Lifecycle marker identity does not match native history")
                 if type(marker.get("deleted")) is not bool or not isinstance(marker.get("commandId"),str) or not 1 <= len(marker["commandId"]) <= 200:
                     raise ValueError("Invalid native lifecycle marker proof")
                 confirmations.append({"deleted":marker["deleted"], "commandId":marker["commandId"], "evidence":"configured-native-marker"})
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, RecursionError):
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
@@ -242,8 +253,7 @@ class Discovery:
                             native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
         return {"uri": uri, "changed": True, "issues": issues}
 
-    @staticmethod
-    def _family_inventory(namespace, budget):
+    def _family_inventory(self, namespace, budget):
         # Count ALL entries, including irrelevant lock/temp files: no hidden unbounded walk.
         values = []
         with os.scandir(namespace) as iterator:
@@ -255,8 +265,9 @@ class Discovery:
                     raise ValueError('namespace-symlink')
                 stamps = []
                 if stat.S_ISDIR(mode) and not entry.name.startswith('.'):
-                    for name in METADATA + ('transcript.jsonl', 'transcript.jsonl.backup'):
-                        path = Path(entry.path)/name
+                    paths = [Path(entry.path)/name for name in METADATA + ('transcript.jsonl', 'transcript.jsonl.backup')]
+                    paths.extend(root/'sessions'/entry.name/'lifecycle.json' for root in self.app_homes)
+                    for path in paths:
                         try:
                             if path.resolve() != path:
                                 raise ValueError('source-metadata-symlink')
@@ -266,7 +277,7 @@ class Discovery:
                             continue
                         if not stat.S_ISREG(info.st_mode):
                             raise ValueError('source-special-file')
-                        stamps.append((info.st_ino, info.st_size, info.st_mtime_ns))
+                        stamps.append((info.st_ino, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ctime_ns))
                 values.append((entry.name, stat.S_ISDIR(mode), stamps))
         return sorted(values)
 
@@ -311,7 +322,8 @@ class Discovery:
             raise ValueError('maxEntries must be 1..512')
         family = self.catalog.descendants(parentUri=parentUri, limit=limit)
         issues, inventories, entries, byte_count = [], {}, 0, 0
-        reads = self.metadata_reads
+        source_reads, source_bytes, admitted_files = 0, 0, 0
+        admitted_sources = {}
         deadline = time.monotonic() + 5
         proof = {'version': 1, 'scope': 'selected-native-project-namespaces',
                  'phase': 'refused', 'issues': issues, 'maxEntries': maxEntries,
@@ -320,10 +332,10 @@ class Discovery:
         def finish():
             result = self.catalog.descendants(parentUri=parentUri, limit=limit)
             proof.update(indexRevision=result['revision'], inventoryHash=hashlib.sha256(json.dumps([(str(path), rows) for path, rows in sorted(inventories.items())], sort_keys=True).encode()).hexdigest(), entriesExamined=entries,
-                         metadataReads=self.metadata_reads-reads, metadataBytesAdmitted=byte_count,
+                         metadataReads=source_reads, metadataBytesAdmitted=source_bytes,
                          namespaces=[str(path) for path in inventories], completedAt=iso(time.time()))
             if proof['metadataReads'] > proof['metadataFileLimit']:
-                issues.append('concurrent-metadata-read-accounting')
+                issues.append('metadata-file-limit')
             proof['phase'] = 'complete' if not issues and result['completeIndexedCoverage'] else 'refused'
             if proof['phase'] == 'complete':
                 token = str(uuid.uuid4())
@@ -387,15 +399,39 @@ class Discovery:
                     entries += len(values)
                     for name, directory, stamps in values:
                         if directory and not name.startswith('.'):
-                            byte_count += sum(stamp[1] for stamp in stamps[:len(METADATA)] if stamp)
+                            paths = [namespace/name/file for file in METADATA]
+                            paths.extend(root/'sessions'/name/'lifecycle.json' for root in self.app_homes)
+                            source_stamps = stamps[:len(METADATA)] + stamps[len(METADATA)+2:]
+                            for path, stamp in zip(paths, source_stamps):
+                                if stamp:
+                                    if path.name == 'lifecycle.json' and stamp[1] > 65536:
+                                        raise ValueError('lifecycle-byte-limit')
+                                    admitted_files += 1
+                                    byte_count += stamp[1]
+                                    admitted_sources[path] = stamp
                     if byte_count > MAX_METADATA:
                         raise ValueError('metadata-byte-limit')
+                    if admitted_files > proof['metadataFileLimit']:
+                        raise ValueError('metadata-file-limit')
                     inventories[namespace] = values
+                    def read_json(path, maximum=MAX_METADATA):
+                        def admit(path, info):
+                            nonlocal source_reads, source_bytes
+                            if time.monotonic() > deadline:
+                                raise ValueError('reconciliation-time-limit')
+                            if admitted_sources.get(path) != (info.st_ino, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ctime_ns):
+                                raise ValueError('source-changed-before-read')
+                            if source_reads >= proof['metadataFileLimit'] or source_bytes + info.st_size > MAX_METADATA:
+                                raise ValueError('source-read-budget-limit')
+                            source_reads += 1
+                            source_bytes += info.st_size
+                            self.metadata_reads += 1
+                        return read_metadata_json(path, maximum, admit=admit)
                     for name, directory, _ in values:
                         if directory and not name.startswith('.'):
                             if time.monotonic() > deadline:
                                 raise ValueError('reconciliation-time-limit')
-                            result = self.hint(str(namespace/name), force=True)
+                            result = self.hint(str(namespace/name), force=True, _read_json=read_json)
                             if result.get('issues') or result.get('empty') or not result.get('uri'):
                                 issues.append('namespace-metadata-incomplete')
                 if issues:

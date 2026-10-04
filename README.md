@@ -416,13 +416,20 @@ does not mean transcript/event bodies were read. The indexed revision binds the
 pure index facts, while this read report and the proof describe the repair.
 
 All directory entries count against the aggregate inventory bound, including
-lock/temp files. Metadata size admission is capped at 8 MiB across visited
-namespaces; file reads may count up to 2,048 at 512 entries. At most 16 configured
+lock/temp files. Every native metadata and configured adapter lifecycle marker
+body shares the aggregate 8 MiB and `4*maxEntries` read limits. Admission counts
+all present sources before reading a namespace; actual opened descriptor sizes
+and read attempts are also checked and reported, including invalid JSON.
+Lifecycle markers, including absent markers, bind both physical inventories;
+creation, replacement or deletion invalidates `verifyFamily` even without an
+indexed revision change. File reads may count up to 2,048 at 512 entries. At most 16 configured
 native homes and 16 adapter homes are supported by this bounded operation.
 Source ambiguity, noncanonical identity, missing files, unsafe/special metadata,
 entry/byte limits, unfinished metadata, cycles/overflow, concurrent discovery or
-changed namespace facts refuse scoped coverage. Native metadata opens use
-nonblocking descriptors so a replacement FIFO cannot block opening. A five-second
+changed namespace facts refuse scoped coverage. All metadata and lifecycle opens
+use nonblocking descriptors, verify regular files after opening, and bind opened
+file identity and size before consuming bytes. A replacement FIFO cannot block
+opening, and file growth or replacement refuses scoped coverage. A five-second
 budget is checked between operations; filesystem call latency is not a hard
 real-time guarantee. Index repair may be partial on refusal; no complete proof
 or canonical effect is claimed.
