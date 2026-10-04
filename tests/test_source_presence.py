@@ -183,12 +183,12 @@ def test_permission_change_during_absence_confirmation_rolls_back(tmp_path,monke
 
 def test_reappearance_replaced_before_confirmation_stays_unavailable(tmp_path,monkeypatch):
     c,d,uri,_,directory,_,native=fixture(tmp_path);disappear(d,directory);native('root')
-    original=c._observe_source_presence
+    original=c._publish_discovery
     def replacing(record,**kwargs):
-        if not kwargs['missing']:
+        if kwargs.get('restore_presence'):
             directory.rename(directory.with_name('old-root'));native('root')
         return original(record,**kwargs)
-    monkeypatch.setattr(c,'_observe_source_presence',replacing)
+    monkeypatch.setattr(c,'_publish_discovery',replacing)
     d.hint(str(directory))
     assert not c.list(connectionId='restore-race')['items']
     with c.connect() as db:assert db.execute('SELECT count(*) FROM source_presence').fetchone()[0]==1
@@ -226,10 +226,13 @@ def test_late_host_summary_cannot_replay_absence_or_override_reappearance(tmp_pa
 
 def test_host_summary_during_restoration_preserves_exact_binding(tmp_path,monkeypatch):
     c,d,uri,_,directory,_,native=fixture(tmp_path);disappear(d,directory);native('root')
-    original=c._observe_source_presence
+    original=c._publish_discovery;once=True
     def summary_before_confirmation(record,**kwargs):
-        if not kwargs['missing']:c.upsert(host_summary(c.get(uri)))
+        nonlocal once
+        if kwargs.get('restore_presence') and once:
+            once=False;c.upsert(host_summary(c.get(uri)))
         return original(record,**kwargs)
-    monkeypatch.setattr(c,'_observe_source_presence',summary_before_confirmation)
+    monkeypatch.setattr(c,'_publish_discovery',summary_before_confirmation)
+    assert not d.hint(str(directory))['changed'] and not c.list(connectionId='first-summary-refusal')['items']
     d.hint(str(directory))
     assert c.get(uri)['storagePath']==str(directory) and c.list(connectionId='restore-summary')['items'][0]['uri']==uri

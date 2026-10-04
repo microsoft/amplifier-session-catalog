@@ -18,6 +18,10 @@ import uuid
 import re
 
 
+class StalePublication(OSError):
+    """Private selected-source CAS/read-set refusal; no native effect occurred."""
+
+
 class InvalidCursor(ValueError):
     pass
 
@@ -233,7 +237,33 @@ class Catalog:
             if len(links)<100:break
             after=links[-1]['uri']
 
+    def _source_snapshot(self, storage, *, db=None):
+        """One exact indexed source and its native visibility; never history bodies."""
+        if db is None:
+            with self.connect() as connection:
+                return self._source_snapshot(storage, db=connection)
+        rows=db.execute("""SELECT s.*,
+            (SELECT deleted FROM native_visibility nv WHERE nv.uri=s.uri) AS native_deleted,
+            (SELECT command_id FROM native_visibility nv WHERE nv.uri=s.uri) AS native_command,
+            (SELECT evidence FROM native_visibility nv WHERE nv.uri=s.uri) AS native_evidence,
+            EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=s.uri AND sp.storage_path=s.storage_path AND sp.missing=1) AS source_missing
+            FROM sessions s WHERE storage_path=? LIMIT 2""",(str(storage),)).fetchall()
+        if len(rows)>1:raise ValueError('Selected native source is ambiguously indexed')
+        row=dict(rows[0]) if rows else None
+        token=hashlib.sha256(json.dumps(row,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        return {'storagePath':str(storage),'token':token,'row':row}
+
+    def _publish_discovery(self, record, *, snapshot, confirm, restore_presence=False, **kwargs):
+        """Private publication guard; not a registered RPC or public upsert field."""
+        if not callable(confirm) or not isinstance(snapshot,dict) or kwargs.get('source','host')=='host':
+            raise ValueError('Exact discovery publication evidence required')
+        return self._upsert(record,_publication=(snapshot,confirm,restore_presence),**kwargs)
+
     def upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None, native_parent=None):
+        return self._upsert(record,source=source,fingerprint=fingerprint,seen_run=seen_run,
+                            confirmed_visibility=confirmed_visibility,native_parent=native_parent)
+
+    def _upsert(self, record, *, source="host", fingerprint=None, seen_run=None, confirmed_visibility=None, native_parent=None, _publication=None):
         if not isinstance(record, dict):
             raise ValueError("record must be an object")
         uri = checked_string(record.get("uri"), "uri", 512)
@@ -276,7 +306,7 @@ class Catalog:
                 raise ValueError('Native parent storage differs from selected project')
         with self.connect() as db:
             known = db.execute("SELECT path FROM workspaces WHERE path=?", (workspace,)).fetchone()
-        if known is None:
+        if known is None and _publication is None:
             self.workspace(workspace)
         if confirmed_visibility is not None:
             if not isinstance(confirmed_visibility, dict) or type(confirmed_visibility.get("deleted")) is not bool or confirmed_visibility.get("evidence") != "configured-native-marker":
@@ -284,6 +314,17 @@ class Catalog:
             checked_string(confirmed_visibility.get("commandId"), "commandId", 200)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            if _publication is not None:
+                snapshot,confirm,restore_presence=_publication
+                if snapshot['storagePath']!=storage:
+                    raise ValueError('Discovery publication storage differs from selected source')
+                current=self._source_snapshot(storage,db=db)
+                if current['token']!=snapshot['token'] or not confirm():
+                    raise StalePublication('Selected source or indexed row changed before publication')
+                if current['row'] and (current['row']['engine'],current['row']['native_id'],current['row']['workspace'])!=(engine,native,workspace):
+                    raise ValueError('Discovery cannot replace a different native source binding')
+                if known is None:
+                    db.execute('INSERT OR IGNORE INTO workspaces VALUES(?,?,?)',(workspace,directory_status(workspace),time.time()))
             prior_managed=db.execute('SELECT s.engine,s.native_id,ml.workspace FROM managed_locations ml JOIN sessions s ON s.uri=ml.uri WHERE ml.uri=?',(uri,)).fetchone()
             if prior_managed and (prior_managed['engine'],prior_managed['native_id'],prior_managed['workspace'])!=(engine,native,workspace):
                 raise ValueError('Managed identity projection cannot be reassigned')
@@ -331,6 +372,10 @@ class Catalog:
                 db.execute("INSERT INTO session_archive VALUES(?,?) ON CONFLICT(uri) DO UPDATE SET archived=excluded.archived",(uri,int(archive)))
             if confirmed_visibility is not None:
                 db.execute("INSERT INTO native_visibility VALUES(?,?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id,evidence=excluded.evidence", (uri, int(confirmed_visibility["deleted"]), confirmed_visibility["commandId"], confirmed_visibility["evidence"]))
+            if _publication is not None and restore_presence:
+                # Presence and metadata publish atomically after the same CAS
+                # and current physical read-set confirmation. Other flags dominate.
+                db.execute('DELETE FROM source_presence WHERE uri=? AND storage_path=?',(uri,storage))
             source_missing = db.execute('SELECT 1 FROM source_presence WHERE uri=? AND storage_path=? AND missing=1',(uri,storage)).fetchone()
             if source_missing:
                 availability='read-only';details['reason']='Native source directory is unavailable'
@@ -356,7 +401,7 @@ class Catalog:
             self._resolve_native_parents(db,engine,native,workspace)
         return self.get(uri)
 
-    def _observe_source_presence(self, record, *, missing, confirm):
+    def _observe_source_presence(self, record, *, missing, confirm, snapshot=None):
         """Discovery-only exact binding CAS; never native deletion authority.
 
         The caller confirms configured path facts again under the index writer
@@ -368,6 +413,8 @@ class Catalog:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row=db.execute('SELECT * FROM sessions WHERE uri=?',(record['uri'],)).fetchone()
+            if snapshot is not None and (snapshot['storagePath']!=storage or self._source_snapshot(storage,db=db)['token']!=snapshot['token']):
+                return False
             if not row or (row['engine'],row['native_id'],row['workspace'],row['storage_path']) != (record['engineId'],record['nativeSessionId'],record['workingDirectory'],storage) or not confirm():
                 return False
             if missing:

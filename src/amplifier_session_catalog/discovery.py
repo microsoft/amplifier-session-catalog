@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from .catalog import Catalog, directory_status, iso, timestamp, managed_location, managed_root
+from .catalog import Catalog, StalePublication, directory_status, iso, timestamp, managed_location, managed_root
 
 class MetadataReadChanged(ValueError):
     """Typed transient descriptor race; public validation remains compatible."""
@@ -105,6 +105,14 @@ def file_stamp(path):
     return [info.st_ino, info.st_mtime_ns, info.st_size]
 
 
+def publication_stamp(path):
+    """Bounded passive source identity including ctime; no descriptor/body read."""
+    try:info=path.stat(follow_symlinks=False)
+    except FileNotFoundError:return None
+    if not stat.S_ISREG(info.st_mode):raise ValueError('Native source must be a regular file')
+    return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
 class Discovery:
     def __init__(self, catalog: Catalog, homes, *, known_workspaces=(), engine_id="amplifier", app_homes=()):
         self.catalog = catalog
@@ -133,16 +141,29 @@ class Discovery:
 
     def hint(self, sessionDirectory, *, run=None, force=False, _read_json=None):
         """Read current facts after a writer hint; never trust hinted metadata."""
-        return self._hint(sessionDirectory, run=run, force=force, _read_json=_read_json)
+        try:return self._hint(sessionDirectory, run=run, force=force, _read_json=_read_json)
+        except StalePublication:
+            return {'changed':False,'issues':['Selected source or indexed row changed before publication']}
 
     def _hint_for_inbox(self, sessionDirectory):
         # Not registered as RPC. Public hints retain their existing result shape.
-        return self._hint(sessionDirectory, retry_transient=True)
+        # One bounded fresh attempt resolves a publication CAS/read-set race.
+        # It also prevents a newer candidate losing recovery when a successful
+        # competitor consumed their shared claim. Native/lifecycle read failures
+        # still retain the claim for a later batch, without an inline retry.
+        for attempt in range(2):
+            try:return self._hint(sessionDirectory,retry_transient=True)
+            except StalePublication:
+                if attempt:raise
 
     def _hint(self, sessionDirectory, *, run=None, force=False, _read_json=None, retry_transient=False):
+        if len(self.app_homes)>16:raise ValueError('Selected source adapter limit exceeds16')
         home, project, identity = self._validate_directory(sessionDirectory)
         directory = Path(sessionDirectory).expanduser().absolute()
-        previous = self.catalog.by_storage(directory)
+        snapshot=self.catalog._source_snapshot(directory)
+        previous=snapshot['row']
+        if previous and (previous['engine']!=self.engine_id or previous['native_id']!=identity):
+            return {'changed':False,'issues':['Selected source belongs to a different native binding']}
         try:
             directory_info = directory.stat(follow_symlinks=False)
         except FileNotFoundError:
@@ -156,18 +177,31 @@ class Discovery:
                 except FileNotFoundError:
                     return True
                 return False
-            changed = self.catalog._observe_source_presence(record, missing=True, confirm=absent)
+            changed = self.catalog._observe_source_presence(record, missing=True, confirm=absent, snapshot=snapshot)
             if not changed and retry_transient:raise RetryableHint('Selected source changed during absence observation')
             return {'uri': record['uri'], 'changed': changed, 'issues': [] if changed else ['Native source changed during absence observation']}
         if not stat.S_ISDIR(directory_info.st_mode):
             raise ValueError('Native source directory must be a nonsymlink directory')
-        stamps = [file_stamp(directory / name) for name in METADATA]
-        transcript = file_stamp(directory / "transcript.jsonl") or file_stamp(directory / "transcript.jsonl.backup")
+        metadata_paths=[directory/name for name in METADATA]
+        transcript_paths=[directory/'transcript.jsonl',directory/'transcript.jsonl.backup']
         markers = [(root / "sessions" / identity / "lifecycle.json") for root in self.app_homes]
-        marker_stamps = [file_stamp(path) for path in markers]
+        paths=metadata_paths+transcript_paths+markers
+        read_set=[publication_stamp(path) for path in paths]
+        def old_stamp(value):return [value[1],value[3],value[2]] if value else None
+        stamps=[old_stamp(value) for value in read_set[:len(METADATA)]]
+        transcript=old_stamp(read_set[len(METADATA)]) or old_stamp(read_set[len(METADATA)+1])
+        marker_stamps=[old_stamp(value) for value in read_set[len(METADATA)+2:]]
+        def confirm():
+            self._validate_directory(directory)
+            try:current=directory.stat(follow_symlinks=False)
+            except FileNotFoundError:return False
+            if not stat.S_ISDIR(current.st_mode) or (current.st_dev,current.st_ino)!=(directory_info.st_dev,directory_info.st_ino):return False
+            if any(stamp and any(part.is_symlink() for part in (path,*path.parents)) for path,stamp in zip(markers,marker_stamps)):
+                raise ValueError('Unsafe native lifecycle marker')
+            return [publication_stamp(path) for path in paths]==read_set
         # A derived-index upgrade must rebuild native parent evidence even when
         # canonical file stamps have not changed since the prior scanner version.
-        fingerprint = hashlib.sha256(json.dumps(['native-parent-v1',stamps, transcript, marker_stamps]).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(['native-publication-v2',directory_info.st_dev,directory_info.st_ino,read_set]).encode()).hexdigest()
         if previous and previous["fingerprint"] == fingerprint and not force and not previous.get("source_missing"):
             if run:
                 self.catalog.touch_seen(previous["uri"], run)
@@ -208,7 +242,7 @@ class Discovery:
             if previous:
                 record = self.catalog.get(previous["uri"])
                 record.update(availability="read-only", reason="Native metadata is currently unavailable")
-                self.catalog.upsert(record, source="native:" + str(home), seen_run=run)
+                self.catalog._publish_discovery(record,source="native:"+str(home),seen_run=run,snapshot=snapshot,confirm=confirm)
                 return {"uri": previous["uri"], "changed": True, "issues": issues}
             return {"changed": False, "issues": issues or ["No readable native metadata"]}
         merged = {**capture, **native}
@@ -298,16 +332,10 @@ class Discovery:
             # its earlier native metadata or partial lifecycle confirmations.
             # A successful competitor may already have consumed their claim.
             raise RetryableHint('Selected authoritative metadata temporarily unavailable')
-        indexed = self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
-                            native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
-        if native and not issues and previous and previous.get("source_missing"):
-            def present():
-                self._validate_directory(directory)
-                current = directory.stat(follow_symlinks=False)
-                return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (directory_info.st_dev, directory_info.st_ino) and [file_stamp(directory/name) for name in METADATA] == stamps
-            restored=self.catalog._observe_source_presence({**record, 'uri': indexed['uri']}, missing=False, confirm=present)
-            if not restored and retry_transient:raise RetryableHint('Selected source changed during presence restoration')
-        return {"uri": uri, "changed": True, "issues": issues}
+        indexed = self.catalog._publish_discovery(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
+                            native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None,
+                            snapshot=snapshot,confirm=confirm,restore_presence=bool(native and not issues and previous and previous.get('source_missing')))
+        return {"uri": indexed['uri'], "changed": True, "issues": issues}
 
     def _family_inventory(self, namespace, budget):
         # Count ALL entries, including irrelevant lock/temp files: no hidden unbounded walk.
