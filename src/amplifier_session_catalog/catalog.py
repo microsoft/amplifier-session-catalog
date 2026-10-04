@@ -290,6 +290,13 @@ class Catalog:
             reserved=db.execute('SELECT engine,native_id,workspace FROM native_claims WHERE uri=? LIMIT 1',(uri,)).fetchone()
             if reserved and (reserved['engine'],reserved['native_id'],reserved['workspace'])!=(engine,native,workspace):raise ValueError('Claimed AHP identity cannot be overwritten')
             if source=='host':
+                # A host summary is metadata, not authority to discard or move
+                # an already discovered exact native source binding.
+                bound=db.execute('SELECT engine,native_id,workspace,storage_path FROM sessions WHERE uri=?',(uri,)).fetchone()
+                if bound and bound['storage_path']:
+                    if (bound['engine'],bound['native_id'],bound['workspace'])!=(engine,native,workspace) or storage is not None and storage!=bound['storage_path']:
+                        raise ValueError('Host summary cannot replace a discovered native source binding')
+                    storage=bound['storage_path']
                 claimed=db.execute('SELECT DISTINCT uri FROM native_claims WHERE engine=? AND native_id=? AND workspace=? LIMIT 2',(engine,native,workspace)).fetchall()
                 if claimed and (len(claimed)!=1 or claimed[0]['uri']!=uri):raise ValueError('Claimed native identity cannot have another AHP mapping')
             if source != 'host':

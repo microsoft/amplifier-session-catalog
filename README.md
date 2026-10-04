@@ -497,7 +497,10 @@ or invalid metadata, permission/IO errors, symlinks, foreign roots and changed
 bindings do not prove physical absence. No history body is read and no worker or
 model is started. Work is bounded to the selected path and its indexed row.
 
-Only a successful current metadata refresh at the same validated physical directory
+A host metadata summary preserves an already discovered exact native source
+binding even when it omits `storagePath` or supplies null; it cannot move that
+binding or change its native identity. Late summaries therefore cannot bypass
+absence. Only a successful current metadata refresh at the same validated physical directory
 can clear its internal absence observation. Native deletion, product exclusion and
 workspace exclusion still dominate. Ordinary upsert, native/product restore,
 workspace recheck and process restart cannot silently clear absence. The durable

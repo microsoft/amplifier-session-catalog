@@ -118,7 +118,7 @@ def test_index_binding_replaced_before_absence_cas_is_not_hidden(tmp_path,monkey
     c,d,uri,_,directory,_,_=fixture(tmp_path);shutil.rmtree(directory)
     original=c._observe_source_presence
     def rebound(record,**kwargs):
-        c.upsert({**record,'storagePath':str(directory.with_name('different'))})
+        c.upsert({**record,'storagePath':str(directory.with_name('different'))},source='native:fixture')
         return original(record,**kwargs)
     monkeypatch.setattr(c,'_observe_source_presence',rebound)
     assert not d.hint(str(directory))['changed'] and c.list(connectionId='binding')['items'][0]['uri']==uri
@@ -192,3 +192,44 @@ def test_reappearance_replaced_before_confirmation_stays_unavailable(tmp_path,mo
     d.hint(str(directory))
     assert not c.list(connectionId='restore-race')['items']
     with c.connect() as db:assert db.execute('SELECT count(*) FROM source_presence').fetchone()[0]==1
+
+
+def host_summary(record):
+    # Actual host index() summary intentionally omits storagePath.
+    value={key:record[key] for key in ('uri','engineId','nativeSessionId','workingDirectory','title','createdAt','modifiedAt')}
+    return {**value,'availability':'available','workspaceAvailability':'present','isArchived':False}
+
+
+@pytest.mark.parametrize('path_field',['omitted','null','same','different'])
+def test_actual_host_summary_cannot_discard_missing_source_binding(tmp_path,path_field):
+    c,d,uri,_,directory,_,_=fixture(tmp_path);disappear(d,directory)
+    record=host_summary(c.get(uri))
+    if path_field=='null':record['storagePath']=None
+    elif path_field=='same':record['storagePath']=str(directory)
+    elif path_field=='different':record['storagePath']=str(directory.with_name('other'))
+    if path_field=='different':
+        with pytest.raises(ValueError):c.upsert(record)
+    else:c.upsert(record)
+    assert c.get(uri)['storagePath']==str(directory) and c.get(uri)['availability']=='read-only'
+    assert not c.list(connectionId='summary')['items']
+    assert d.hint(str(directory))['changed']
+
+
+def test_late_host_summary_cannot_replay_absence_or_override_reappearance(tmp_path):
+    c,d,uri,_,directory,_,native=fixture(tmp_path);disappear(d,directory)
+    stale=host_summary(c.get(uri));native('root');d.hint(str(directory));c.upsert(stale)
+    assert c.get(uri)['storagePath']==str(directory) and c.get(uri)['availability']=='available'
+    assert c.list(connectionId='late-summary')['items'][0]['uri']==uri
+    disappear(d,directory);c.upsert(stale)
+    assert not c.list(connectionId='late-missing-summary')['items']
+
+
+def test_host_summary_during_restoration_preserves_exact_binding(tmp_path,monkeypatch):
+    c,d,uri,_,directory,_,native=fixture(tmp_path);disappear(d,directory);native('root')
+    original=c._observe_source_presence
+    def summary_before_confirmation(record,**kwargs):
+        if not kwargs['missing']:c.upsert(host_summary(c.get(uri)))
+        return original(record,**kwargs)
+    monkeypatch.setattr(c,'_observe_source_presence',summary_before_confirmation)
+    d.hint(str(directory))
+    assert c.get(uri)['storagePath']==str(directory) and c.list(connectionId='restore-summary')['items'][0]['uri']==uri
