@@ -411,6 +411,9 @@ The result is the ordinary descendant envelope plus `familyDiscovery` with:
 `externalWriterCoverage:false`, `transcriptBodiesRead:false`,
 `nativeOwnershipVerified:false`. Complete proofs also have `verificationToken`.
 The proof's `indexRevision` equals the returned pure indexed `revision`.
+Reconciliation reports `nativeFilesRead:true` when it opened metadata files; this
+does not mean transcript/event bodies were read. The indexed revision binds the
+pure index facts, while this read report and the proof describe the repair.
 
 All directory entries count against the aggregate inventory bound, including
 lock/temp files. Metadata size admission is capped at 8 MiB across visited

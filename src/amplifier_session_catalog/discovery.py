@@ -335,6 +335,7 @@ class Discovery:
                         self._family_proofs.popitem(last=False)
                 proof['verificationToken'] = token
             result['familyDiscovery'] = proof
+            result['nativeFilesRead'] = bool(proof['metadataReads'])
             return result
         if not self._lock.acquire(blocking=False):
             issues.append('discovery-busy')

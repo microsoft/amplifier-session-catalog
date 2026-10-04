@@ -45,6 +45,8 @@ def test_stale_global_failure_repaired_by_bounded_selected_native_metadata(tmp_p
     proof=result['familyDiscovery']
     assert proof['phase']=='complete' and not proof['issues']
     assert proof['scope']=='selected-native-project-namespaces' and proof['metadataReads']==2
+    assert result['nativeFilesRead'] is True
+    assert catalog.descendants(parentUri=uri)['nativeFilesRead'] is False
     assert proof['indexRevision']==result['revision']==catalog.descendants(parentUri=uri)['revision']
     assert result['freshness']==old['freshness'] and result['root']['uri']==uri
     assert len(result['items'])==1 and result['items'][0]['parentUri']==uri
