@@ -1,6 +1,7 @@
 """Incremental metadata discovery. No transcript or event contents are read."""
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import os
@@ -49,18 +50,28 @@ def classify(identity, *sources):
     return ("child" if "_" in identity else "root"), None
 
 
-def small_metadata(path):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as stream:
+def read_metadata_json(path, maximum=MAX_METADATA, *, admit=None):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb", buffering=0) as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_METADATA:
-            raise ValueError("Native metadata must be a regular file of at most 8 MiB")
-        data = stream.read(MAX_METADATA + 1)
-        if len(data) > MAX_METADATA:
-            raise ValueError("Native metadata grew beyond the limit")
+        if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
+            raise ValueError("Native metadata must be a bounded regular file")
+        if admit is not None:
+            admit(Path(path), info)
+        # Admit the opened descriptor, not an earlier path stat. Never consume
+        # bytes beyond that admission, even if a concurrent writer grows it.
+        data = stream.read(info.st_size)
+        after = os.fstat(stream.fileno())
+        if len(data) != info.st_size or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("Native metadata changed during read")
     value = json.loads(data)
     if not isinstance(value, dict):
         raise ValueError("Native metadata must be an object")
+    return value
+
+
+def small_metadata(path, *, read_json=read_metadata_json):
+    value = read_json(path)
     result = {k: v for k, v in value.items() if k in FIELDS and (v is None or isinstance(v, (str, int, float, bool)))}
     if 'location' in value:
         try:result['location']=managed_location(value['location'])
@@ -97,6 +108,8 @@ class Discovery:
         self._lock = threading.Lock()
         self._thread = None
         self.metadata_reads = 0
+        self._family_proofs = OrderedDict()
+        self._proof_lock = threading.Lock()
 
     def _validate_directory(self, directory):
         directory = Path(directory).expanduser().absolute()
@@ -110,7 +123,7 @@ class Discovery:
                 return home, parts[0], parts[2]
         raise ValueError("Session directory is outside configured native roots or uses a symlink")
 
-    def hint(self, sessionDirectory, *, run=None, force=False):
+    def hint(self, sessionDirectory, *, run=None, force=False, _read_json=None):
         """Read current facts after a writer hint; never trust hinted metadata."""
         home, project, identity = self._validate_directory(sessionDirectory)
         directory = Path(sessionDirectory).expanduser().absolute()
@@ -127,14 +140,18 @@ class Discovery:
                 self.catalog.touch_seen(previous["uri"], run)
             return {"uri": previous["uri"], "changed": False}
         native, capture, naming, issues = {}, {}, {}, []
+        def read_json(path, maximum=MAX_METADATA):
+            def count(_path, _info):
+                self.metadata_reads += 1
+            return (_read_json(path, maximum) if _read_json is not None
+                    else read_metadata_json(path, maximum, admit=count))
         for i, name in enumerate(METADATA):
             if not stamps[i]:
                 continue
             if i == 1 and native:
                 continue
             try:
-                data = small_metadata(directory / name)
-                self.metadata_reads += 1
+                data = small_metadata(directory / name, read_json=read_json)
                 if i in (0, 1):
                     native = data
                     if i == 1:
@@ -222,22 +239,212 @@ class Discovery:
             try:
                 if stamp[2] > 65536 or any(part.is_symlink() for part in (path, *path.parents)):
                     raise ValueError("Unsafe native lifecycle marker")
-                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                with os.fdopen(fd, "rb") as stream: raw = stream.read(65537)
-                if len(raw) > 65536: raise ValueError("Oversized lifecycle marker")
-                marker = json.loads(raw)
+                marker = read_json(path, 65536)
                 if marker.get("sessionId") != identity or marker.get("historyCwd") != workspace:
                     raise ValueError("Lifecycle marker identity does not match native history")
                 if type(marker.get("deleted")) is not bool or not isinstance(marker.get("commandId"),str) or not 1 <= len(marker["commandId"]) <= 200:
                     raise ValueError("Invalid native lifecycle marker proof")
                 confirmations.append({"deleted":marker["deleted"], "commandId":marker["commandId"], "evidence":"configured-native-marker"})
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, RecursionError):
                 issues.append("Native lifecycle marker is unavailable or invalid; prior visibility retained")
         confirmation=confirmations[0] if confirmations and all(value==confirmations[0] for value in confirmations) else None
         if confirmations and confirmation is None: issues.append("Conflicting native lifecycle markers; prior visibility retained")
         self.catalog.upsert(record, source="native:" + str(home), fingerprint=fingerprint, seen_run=run, confirmed_visibility=confirmation,
                             native_parent={'nativeId':parent,'storagePath':str(directory.parent/parent)} if parent else None)
         return {"uri": uri, "changed": True, "issues": issues}
+
+    def _family_inventory(self, namespace, budget):
+        # Count ALL entries, including irrelevant lock/temp files: no hidden unbounded walk.
+        values = []
+        with os.scandir(namespace) as iterator:
+            for entry in iterator:
+                if len(values) >= budget:
+                    raise ValueError('namespace-entry-limit')
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    raise ValueError('namespace-symlink')
+                stamps = []
+                if stat.S_ISDIR(mode) and not entry.name.startswith('.'):
+                    paths = [Path(entry.path)/name for name in METADATA + ('transcript.jsonl', 'transcript.jsonl.backup')]
+                    paths.extend(root/'sessions'/entry.name/'lifecycle.json' for root in self.app_homes)
+                    for path in paths:
+                        try:
+                            if path.resolve() != path:
+                                raise ValueError('source-metadata-symlink')
+                            info = path.lstat()
+                        except FileNotFoundError:
+                            stamps.append(None)
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            raise ValueError('source-special-file')
+                        stamps.append((info.st_ino, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ctime_ns))
+                values.append((entry.name, stat.S_ISDIR(mode), stamps))
+        return sorted(values)
+
+    def verify_family(self, *, parentUri, verificationToken):
+        """Passive bounded physical/index recheck; never repair or authorize effects."""
+        if not isinstance(parentUri, str) or not parentUri or len(parentUri) > 512:
+            raise ValueError('Invalid parentUri')
+        if not isinstance(verificationToken, str) or len(verificationToken) > 200:
+            raise ValueError('Invalid verificationToken')
+        result = {'version': 1, 'scope': 'selected-native-project-namespaces',
+                  'parentUri': parentUri, 'valid': False, 'issues': [],
+                  'externalWriterCoverage': False, 'nativeOwnershipVerified': False,
+                  'transcriptBodiesRead': False}
+        with self._proof_lock:
+            prior = self._family_proofs.get(verificationToken)
+        if not prior or prior['parentUri'] != parentUri or prior['expires'] < time.monotonic():
+            result['issues'].append('unknown-expired-or-mismatched-family-proof')
+        else:
+            result.update(indexRevision=prior['revision'], inventoryHash=prior['inventoryHash'])
+            deadline = time.monotonic()+5
+            try:
+                if self.catalog.descendants(parentUri=parentUri, limit=prior['limit'])['revision'] != prior['revision']:
+                    raise ValueError('indexed-family-changed')
+                for namespace, inventory in prior['inventories'].items():
+                    if time.monotonic() > deadline:
+                        raise ValueError('verification-time-limit')
+                    if self._family_inventory(namespace, len(inventory)) != inventory:
+                        raise ValueError('native-namespace-facts-changed')
+                if self.catalog.descendants(parentUri=parentUri, limit=prior['limit'])['revision'] != prior['revision']:
+                    raise ValueError('indexed-family-changed')
+                result['valid'] = True
+            except (OSError, ValueError, RuntimeError) as exc:
+                result['issues'].append(str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+        result['completedAt'] = iso(time.time())
+        return result
+
+    def reconcile_family(self, *, parentUri, limit=100, maxEntries=512):
+        """Bounded selected namespace repair; never a native ownership proof."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('limit must be 1..100')
+        if type(maxEntries) is not int or not 1 <= maxEntries <= 512:
+            raise ValueError('maxEntries must be 1..512')
+        family = self.catalog.descendants(parentUri=parentUri, limit=limit)
+        issues, inventories, entries, byte_count = [], {}, 0, 0
+        source_reads, source_bytes, admitted_files = 0, 0, 0
+        admitted_sources = {}
+        deadline = time.monotonic() + 5
+        proof = {'version': 1, 'scope': 'selected-native-project-namespaces',
+                 'phase': 'refused', 'issues': issues, 'maxEntries': maxEntries,
+                 'metadataByteLimit': MAX_METADATA, 'metadataFileLimit': 4*maxEntries, 'externalWriterCoverage': False,
+                 'transcriptBodiesRead': False, 'nativeOwnershipVerified': False}
+        def finish():
+            result = self.catalog.descendants(parentUri=parentUri, limit=limit)
+            proof.update(indexRevision=result['revision'], inventoryHash=hashlib.sha256(json.dumps([(str(path), rows) for path, rows in sorted(inventories.items())], sort_keys=True).encode()).hexdigest(), entriesExamined=entries,
+                         metadataReads=source_reads, metadataBytesAdmitted=source_bytes,
+                         namespaces=[str(path) for path in inventories], completedAt=iso(time.time()))
+            if proof['metadataReads'] > proof['metadataFileLimit']:
+                issues.append('metadata-file-limit')
+            proof['phase'] = 'complete' if not issues and result['completeIndexedCoverage'] else 'refused'
+            if proof['phase'] == 'complete':
+                token = str(uuid.uuid4())
+                with self._proof_lock:
+                    self._family_proofs[token] = {'parentUri': parentUri, 'limit': limit,
+                        'revision': result['revision'], 'inventoryHash': proof['inventoryHash'],
+                        'inventories': inventories, 'expires': time.monotonic()+300}
+                    while len(self._family_proofs) > 64:
+                        self._family_proofs.popitem(last=False)
+                proof['verificationToken'] = token
+            result['familyDiscovery'] = proof
+            result['nativeFilesRead'] = bool(proof['metadataReads'])
+            return result
+        if not self._lock.acquire(blocking=False):
+            issues.append('discovery-busy')
+            return finish()
+        try:
+            if len(self.homes) > 16 or len(self.app_homes) > 16:
+                raise ValueError('configured-source-limit')
+            def source(row):
+                if row['engineId'] != self.engine_id:
+                    raise ValueError('source-engine-unconfigured')
+                known = self.catalog.get(row['uri'])
+                if not known:
+                    raise ValueError('source-not-indexed')
+                workspace = known['workingDirectory']
+                if str(Path(workspace).resolve()) != workspace:
+                    raise ValueError('source-workspace-noncanonical')
+                location = known.get('storagePath')
+                if location:
+                    directory = Path(location)
+                    home, project, identity = self._validate_directory(directory)
+                    if identity != known['nativeSessionId'] or project != project_slug(workspace):
+                        raise ValueError('source-storage-identity-mismatch')
+                else:
+                    candidates = [home/'projects'/project_slug(workspace)/'sessions'/known['nativeSessionId']
+                                  for home in self.homes]
+                    candidates = [path for path in candidates if path.is_dir() and path.resolve() == path]
+                    if len(candidates) != 1:
+                        raise ValueError('source-missing-or-ambiguous')
+                    directory = candidates[0]
+                    self._validate_directory(directory)
+                if not directory.is_dir():
+                    raise ValueError('source-directory-missing')
+                return directory.parent
+            if not family['rootKnown']:
+                issues.append('root-not-indexed')
+                return finish()
+            while True:
+                if time.monotonic() > deadline:
+                    raise ValueError('reconciliation-time-limit')
+                family = self.catalog.descendants(parentUri=parentUri, limit=limit)
+                if family['truncated'] or set(family['issues']) & {'cycle', 'depth-limit'}:
+                    issues.append('indexed-family-incomplete')
+                    break
+                pending = {source(row) for row in [family['root'], *family['items']]} - set(inventories)
+                if not pending:
+                    break
+                for namespace in sorted(pending):
+                    values = self._family_inventory(namespace, maxEntries-entries)
+                    entries += len(values)
+                    for name, directory, stamps in values:
+                        if directory and not name.startswith('.'):
+                            paths = [namespace/name/file for file in METADATA]
+                            paths.extend(root/'sessions'/name/'lifecycle.json' for root in self.app_homes)
+                            source_stamps = stamps[:len(METADATA)] + stamps[len(METADATA)+2:]
+                            for path, stamp in zip(paths, source_stamps):
+                                if stamp:
+                                    if path.name == 'lifecycle.json' and stamp[1] > 65536:
+                                        raise ValueError('lifecycle-byte-limit')
+                                    admitted_files += 1
+                                    byte_count += stamp[1]
+                                    admitted_sources[path] = stamp
+                    if byte_count > MAX_METADATA:
+                        raise ValueError('metadata-byte-limit')
+                    if admitted_files > proof['metadataFileLimit']:
+                        raise ValueError('metadata-file-limit')
+                    inventories[namespace] = values
+                    def read_json(path, maximum=MAX_METADATA):
+                        def admit(path, info):
+                            nonlocal source_reads, source_bytes
+                            if time.monotonic() > deadline:
+                                raise ValueError('reconciliation-time-limit')
+                            if admitted_sources.get(path) != (info.st_ino, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ctime_ns):
+                                raise ValueError('source-changed-before-read')
+                            if source_reads >= proof['metadataFileLimit'] or source_bytes + info.st_size > MAX_METADATA:
+                                raise ValueError('source-read-budget-limit')
+                            source_reads += 1
+                            source_bytes += info.st_size
+                            self.metadata_reads += 1
+                        return read_metadata_json(path, maximum, admit=admit)
+                    for name, directory, _ in values:
+                        if directory and not name.startswith('.'):
+                            if time.monotonic() > deadline:
+                                raise ValueError('reconciliation-time-limit')
+                            result = self.hint(str(namespace/name), force=True, _read_json=read_json)
+                            if result.get('issues') or result.get('empty') or not result.get('uri'):
+                                issues.append('namespace-metadata-incomplete')
+                if issues:
+                    break
+            for namespace, previous in inventories.items():
+                if self._family_inventory(namespace, len(previous)) != previous:
+                    issues.append('source-changed-during-reconciliation')
+            return finish()
+        except (OSError, ValueError, RuntimeError) as exc:
+            issues.append(str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+            return finish()
+        finally:
+            self._lock.release()
 
     @staticmethod
     def _directories(path):
