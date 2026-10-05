@@ -16,6 +16,8 @@ import stat
 import time
 import uuid
 import re
+import threading
+from collections import OrderedDict
 
 
 class StalePublication(OSError):
@@ -24,6 +26,10 @@ class StalePublication(OSError):
 
 class InvalidCursor(ValueError):
     pass
+
+
+class LibraryRefreshRequired(InvalidCursor):
+    """An ordinary live query lost its continuation; no frozen pages retained."""
 
 
 def timestamp(value, default=0.0):
@@ -114,6 +120,8 @@ class Catalog:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.secret = secrets.token_bytes(32)
+        self.library_lock = threading.RLock()
+        self.library_guards = OrderedDict()
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, 1):
@@ -178,6 +186,14 @@ class Catalog:
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
             """)
+        with self.connect() as db:
+            db.executescript("""
+                CREATE INDEX IF NOT EXISTS library_created ON sessions(visible,kind,created_at DESC,uri);
+                CREATE INDEX IF NOT EXISTS library_name ON sessions(visible,kind,lower(title),uri);
+                CREATE INDEX IF NOT EXISTS library_attention_activity ON sessions(visible,kind,modified_at DESC,uri) WHERE coalesce(json_extract(details,'$.hostObservation.effect'),'unverified') IN ('error','unknown');
+                CREATE INDEX IF NOT EXISTS library_attention_created ON sessions(visible,kind,created_at DESC,uri) WHERE coalesce(json_extract(details,'$.hostObservation.effect'),'unverified') IN ('error','unknown');
+                CREATE INDEX IF NOT EXISTS library_attention_name ON sessions(visible,kind,lower(title),uri) WHERE coalesce(json_extract(details,'$.hostObservation.effect'),'unverified') IN ('error','unknown');
+            """)
         # Repair only derived workspace identity metadata, in bounded migration batches.
         while True:
             with self.connect() as db:
@@ -191,9 +207,42 @@ class Catalog:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
+        events = set()
+        overflow = False
+        def changed(workspace, fields):
+            nonlocal overflow
+            if len(events)<256: events.add((workspace,fields))
+            else: overflow=True
+            return 0
+        db.create_function('library_changed',2,changed)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='sessions'").fetchone():
+            db.executescript("""
+                CREATE TEMP TRIGGER library_insert AFTER INSERT ON main.sessions BEGIN SELECT library_changed(NEW.workspace,'membership'); END;
+                CREATE TEMP TRIGGER library_delete AFTER DELETE ON main.sessions BEGIN SELECT library_changed(OLD.workspace,'membership'); END;
+                CREATE TEMP TRIGGER library_membership AFTER UPDATE ON main.sessions WHEN OLD.visible<>NEW.visible OR OLD.kind<>NEW.kind OR OLD.workspace<>NEW.workspace OR OLD.parent_uri IS NOT NEW.parent_uri OR OLD.native_id<>NEW.native_id OR json_extract(OLD.details,'$.location') IS NOT json_extract(NEW.details,'$.location') BEGIN SELECT library_changed(OLD.workspace,'membership'); SELECT library_changed(NEW.workspace,'membership'); END;
+                CREATE TEMP TRIGGER library_title AFTER UPDATE OF title ON main.sessions WHEN OLD.title<>NEW.title BEGIN SELECT library_changed(NEW.workspace,'title'); END;
+                CREATE TEMP TRIGGER library_activity AFTER UPDATE OF modified_at ON main.sessions WHEN OLD.modified_at<>NEW.modified_at BEGIN SELECT library_changed(NEW.workspace,'activity'); END;
+                CREATE TEMP TRIGGER library_created AFTER UPDATE OF created_at ON main.sessions WHEN OLD.created_at<>NEW.created_at BEGIN SELECT library_changed(NEW.workspace,'created'); END;
+                CREATE TEMP TRIGGER library_effect AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.effect') IS NOT json_extract(NEW.details,'$.hostObservation.effect') BEGIN SELECT library_changed(NEW.workspace,'effect'); END;
+                CREATE TEMP TRIGGER library_archive_insert AFTER INSERT ON main.session_archive BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
+                CREATE TEMP TRIGGER library_archive_update AFTER UPDATE ON main.session_archive WHEN OLD.archived<>NEW.archived BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
+                CREATE TEMP TRIGGER library_workspace AFTER UPDATE ON main.workspace_index WHEN OLD.name<>NEW.name OR OLD.hidden<>NEW.hidden OR OLD.availability<>NEW.availability BEGIN SELECT library_changed(NEW.path,'membership'); END;
+            """)
         try:
             yield db
-            db.commit()
+            with self.library_lock:
+                db.commit()
+                for guard in self.library_guards.values():
+                    if overflow:
+                        guard['dirty']=True
+                        continue
+                    q=guard['query']
+                    for workspace,fields in events:
+                        if q.get('workingDirectory') and q['workingDirectory']!=workspace: continue
+                        if not any(workspace==r or workspace.startswith(r.rstrip('/')+'/') for r in [*q['allowedWorkspaceRoots'],*(q.get('allowedManagedRoots') or [])]): continue
+                        if fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
+                            guard['dirty']=True
+                            break
         except BaseException:
             db.rollback()
             raise
@@ -307,6 +356,8 @@ class Catalog:
                 raise ValueError('Native parent storage differs from selected project')
         with self.connect() as db:
             known = db.execute("SELECT path FROM workspaces WHERE path=?", (workspace,)).fetchone()
+        if known is None and 'hostObservationOnly' in record:
+            raise ValueError('Host observation requires retained workspace identity')
         if known is None and _publication is None:
             self.workspace(workspace)
         if confirmed_visibility is not None:
@@ -353,6 +404,29 @@ class Catalog:
                     known_row=matches[0];uri=known_row['uri']
                     if claims:
                         title=known_row['title'];created=known_row['created_at']
+            previous = db.execute('SELECT details FROM sessions WHERE uri=?',(uri,)).fetchone()
+            observation = json.loads(previous['details']).get('hostObservation') if previous else None
+            if source == 'host' and 'hostObservation' in record:
+                candidate = record['hostObservation']
+                if not isinstance(candidate,dict) or set(candidate)!={'version','source','incarnation','revision','observedAt','effect','unknownChecked'} or type(candidate['version']) is not int or candidate['version']!=1 or type(candidate['revision']) is not int or candidate['revision']<0 or candidate['effect'] not in {'unverified','settled','error','unknown'} or candidate['unknownChecked'] is not True:
+                    raise ValueError('Invalid checked Host observation')
+                for key in ('source','incarnation','observedAt'): checked_string(candidate[key],key,200)
+                if timestamp(candidate['observedAt'],-1)<0:raise ValueError('Invalid observation time')
+                if observation and observation['source']!=candidate['source']: raise ValueError('Host observation belongs to another source')
+                if not observation or observation['incarnation']!=candidate['incarnation'] or candidate['revision']>observation['revision']:
+                    observation = dict(candidate)
+            elif source!='host' and 'hostObservation' in record:
+                raise ValueError('Native discovery cannot author Host observation')
+            if observation: details['hostObservation']=observation
+            if 'hostObservationOnly' in record:
+                if record['hostObservationOnly'] is not True or source!='host' or 'hostObservation' not in record:
+                    raise ValueError('Checked Host-only observation required')
+                binding=db.execute('SELECT engine,native_id,workspace FROM sessions WHERE uri=?',(uri,)).fetchone()
+                if not binding or (binding['engine'],binding['native_id'],binding['workspace'])!=(engine,native,workspace):
+                    raise ValueError('Host observation requires retained exact catalog identity')
+                retained=json.loads(previous['details']);retained['hostObservation']=observation
+                db.execute('UPDATE sessions SET details=? WHERE uri=?',(json.dumps(retained),uri))
+                return {'uri':uri,'hostObservation':observation}
             managed=db.execute('SELECT * FROM managed_locations WHERE uri=?',(uri,)).fetchone()
             if managed:
                 if managed['workspace']!=workspace:
@@ -890,6 +964,10 @@ class Catalog:
             result["nextCursor"] = self._cursor({"scope": scope, "modified": last["modified_at"],
                                                 "uri": last["uri"], "expires": time.time() + 3600})
         return result
+
+    def library_query(self, **params):
+        from .library import library_query
+        return library_query(self, **params)
 
     def retention_candidates(self, *, connectionId, modifiedBefore, allowedWorkspaceRoots,
                              limit=50, cursor=None, workingDirectory=None, allowedManagedRoots=None):

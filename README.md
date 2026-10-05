@@ -570,3 +570,12 @@ lifecycle read failures still return before publication and wait for a later bat
 accepted usable partial metadata and malformed/unsafe/unconfigured poison treatment
 remain unchanged. All publication hooks and row tokens are private, unregistered
 implementation details; public upsert and notice fields do not expand.
+
+## Live library query v1
+
+The additive [library contract](contracts/library-query.v1.md) provides global
+indexed sorting, literal search and observed activity before bounded pages.
+`libraryCapabilities` negotiates it; ordinary `list` remains compatible. Cold
+runtime unknown is separate from retained uncertain effects. Current Host facts
+are bounded and observations carry explicit freshness. No current global totals,
+frozen pages, native history reads or worker initialization are implied.

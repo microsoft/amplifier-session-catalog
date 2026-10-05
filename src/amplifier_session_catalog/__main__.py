@@ -8,7 +8,7 @@ import math
 import sys
 import threading
 
-from .catalog import Catalog
+from .catalog import Catalog, LibraryRefreshRequired
 from .discovery import Discovery
 from .hints import HintInbox
 
@@ -17,7 +17,7 @@ class Server:
     def __init__(self, catalog, discovery):
         self.catalog = catalog
         self.discovery = discovery
-        self.methods = {"list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
+        self.methods = {"libraryCapabilities": lambda: {"version":1,"paging":"live","maxPage":50,"maxLiveFacts":64,"counts":False}, "libraryQuery": catalog.library_query, "list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
                         "verifyFamily": discovery.verify_family, "reconcileFamily": discovery.reconcile_family, "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
@@ -41,6 +41,8 @@ class Server:
                 raise ValueError("params must be an object")
             result = method(**params)
             response = {"jsonrpc": "2.0", "id": identity, "result": result}
+        except LibraryRefreshRequired as exc:
+            response = {"jsonrpc": "2.0", "id": identity, "error": {"code": -32014, "message": str(exc), "data": {"refreshRequired": True}}}
         except (ValueError, TypeError) as exc:
             response = {"jsonrpc": "2.0", "id": identity, "error": {"code": -32602, "message": str(exc)}}
         except Exception as exc:
