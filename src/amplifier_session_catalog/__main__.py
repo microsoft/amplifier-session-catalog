@@ -28,6 +28,10 @@ class Server:
                         "retentionCandidates":catalog.retention_candidates,"descendants":catalog.descendants}
 
     def handle(self, request):
+        with self.catalog.connection_scope():
+            return self._handle(request)
+
+    def _handle(self, request):
         identity = request.get("id") if isinstance(request, dict) else None
         try:
             if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
