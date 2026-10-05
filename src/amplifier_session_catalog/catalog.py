@@ -377,6 +377,10 @@ class Catalog:
                     raise ValueError('Discovery cannot replace a different native source binding')
                 if known is None:
                     db.execute('INSERT OR IGNORE INTO workspaces VALUES(?,?,?)',(workspace,directory_status(workspace),time.time()))
+                    # Cold discovery must publish the browse index in this same
+                    # transaction; a later Catalog restart is not a readiness step.
+                    workspace_availability=db.execute('SELECT availability FROM workspaces WHERE path=?',(workspace,)).fetchone()[0]
+                    self._workspace_index(db,workspace,workspace_availability)
             prior_managed=db.execute('SELECT s.engine,s.native_id,ml.workspace FROM managed_locations ml JOIN sessions s ON s.uri=ml.uri WHERE ml.uri=?',(uri,)).fetchone()
             if prior_managed and (prior_managed['engine'],prior_managed['native_id'],prior_managed['workspace'])!=(engine,native,workspace):
                 raise ValueError('Managed identity projection cannot be reassigned')
