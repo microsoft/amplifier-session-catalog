@@ -94,6 +94,47 @@ def test_real_scan_keeps_individual_commits_and_closes_handle(tmp_path,monkeypat
     assert len(c.list_workspaces(connectionId='same-process')['items'])==4
 
 
+@pytest.mark.parametrize('failure',['body','commit'])
+def test_failed_rollback_discards_handle_before_later_public_operation(tmp_path,monkeypatch,failure):
+    w=tmp_path/'workspace';w.mkdir();c=Catalog(tmp_path/'index.sqlite')
+    for n in range(2):c.upsert(row(w,n))
+    cursor=query(c,w,sort='name',limit=1)['nextCursor']
+    real=sqlite3.connect;opened=[];closed=[]
+    class FailedRollback(sqlite3.Connection):
+        fail_rollback=False;fail_commit=False
+        def rollback(self):
+            if self.fail_rollback:raise sqlite3.OperationalError('rollback failed')
+            return super().rollback()
+        def commit(self):
+            if self.fail_commit:raise sqlite3.OperationalError('commit failed')
+            return super().commit()
+        def close(self):
+            closed.append((self,threading.get_ident()));super().close()
+    def connect(*args,**kwargs):
+        db=real(*args,**kwargs,factory=FailedRollback)
+        opened.append((db,threading.get_ident()));return db
+    monkeypatch.setattr(sqlite3,'connect',connect)
+    with c.connection_scope():
+        with pytest.raises(sqlite3.OperationalError,match='rollback failed'):
+            with c.connect() as failed:
+                failed.execute("UPDATE sessions SET title='uncommitted' WHERE uri=?",(row(w,0)['uri'],))
+                failed.fail_rollback=True
+                if failure=='body':raise ValueError('operation failed')
+                failed.fail_commit=True
+        assert c._connection_owner.scope['connection'] is None
+        assert closed==opened
+        with pytest.raises(sqlite3.ProgrammingError):failed.execute('SELECT 1')
+        c.progress({'phase':'failed','issues':1})
+        assert c.get(row(w,0)['uri'])['title']==row(w,0)['title']
+        query(c,w,sort='name',limit=1,cursor=cursor)
+        with c.connect() as replacement:assert replacement is not failed
+        with c.connect() as db:
+            db.execute("UPDATE sessions SET title='committed' WHERE uri=?",(row(w,0)['uri'],))
+        with pytest.raises(InvalidCursor):query(c,w,sort='name',limit=1,cursor=cursor)
+        assert c.get(row(w,0)['uri'])['title']=='committed'
+    assert len(closed)==len(opened) and set(closed)==set(opened)
+
+
 def test_hint_source_reads_are_outside_writer_transaction_and_closes(tmp_path,monkeypatch):
     c=Catalog(tmp_path/'index.sqlite');w=tmp_path/'workspace';w.mkdir();home=tmp_path/'native';directory=source(home,w,'root')
     d=Discovery(c,[home]);opened,closed,_=track(monkeypatch);original=os.open;reads=[]

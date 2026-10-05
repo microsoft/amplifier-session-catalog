@@ -281,12 +281,17 @@ class Catalog:
                             guard['dirty']=True
                             break
         except BaseException:
-            db.rollback()
+            try:
+                db.rollback()
+            except BaseException:
+                # An uncertain transaction must never reach a later lease.
+                if reused:owner['connection']=None
+                raise
             raise
         finally:
             state['events'].clear();state['overflow']=False
             if reused:owner['leased']=False
-            else:db.close()
+            if not reused or owner['connection'] is not state:db.close()
 
     @staticmethod
     def workspace_id(path):
