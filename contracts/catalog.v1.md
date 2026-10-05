@@ -83,3 +83,15 @@ behavior and live adoption were not qualified by this catalog packet. Desired
 preservation and responsiveness remain promises despite these gaps. Cross-owner
 semantics or new obligations require coordinated review; this document introduces
 no runtime feature and does not self-ratify pending product decisions.
+
+## Derived index continuity status
+
+The trusted product projection status now includes an immutable database
+`indexIncarnation` and computed `projectionPresent` alongside compatible
+source/revision fields. The [product visibility contract](product-visibility.v1.json)
+and [README lifecycle](../README.md#index-continuity-and-compatibility) define
+transactional initialization, one-snapshot reads, legacy and copy/restore limits.
+[Continuity tests](../tests/test_index_incarnation.py) cover retention, recreation,
+legacy preservation, failed initialization and concurrent snapshot/initialization.
+This metadata does not acknowledge Host qualification or change browsing,
+mutation, full discovery, directory reappearance or family/absence eligibility.

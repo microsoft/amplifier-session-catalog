@@ -61,7 +61,8 @@ def test_exact_command_recovers_after_restart_and_newer_projection(tmp_path):
     assert not catalog.get(row['uri'])['productHidden']
     assert catalog.session_visibility_projection_receipt(source='host',commandId='reset')==expected
     assert catalog.session_visibility_projection_receipt(source='host',commandId='unknown') is None
-    assert catalog.session_visibility_projection_status(source='host')=={'source':'host','revision':2}
+    status=catalog.session_visibility_projection_status(source='host')
+    assert status=={'source':'host','revision':2,'indexIncarnation':status['indexIncarnation'],'projectionPresent':True}
     with pytest.raises(ValueError,match='content changed'):project(catalog,[(row['uri'],False)])
 
 

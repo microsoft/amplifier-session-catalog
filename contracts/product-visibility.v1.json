@@ -31,9 +31,12 @@
         "source": "owner ID"
       },
       "result": {
-        "source": "owner ID",
-        "revision": "applied checkpoint or 0"
-      }
+        "source": "requested owner selector; a persisted owner checkpoint is evidenced only by projectionPresent",
+        "revision": "source checkpoint or0 when absent; unchanged compatibility field",
+        "indexIncarnation": "immutable canonical UUID persisted once in existing progress metadata for this derived database",
+        "projectionPresent": "computed boolean: a source-keyed projection row actually exists; not persisted readiness"
+      },
+      "atomicity": "Identity, actual row presence and checkpoint are read in one SQLite statement/snapshot from the active handle. Invalid or missing identity refuses; status never repairs it."
     },
     "sessionVisibilityProjectionReceipt": {
       "params": {
@@ -64,5 +67,11 @@
     "metadata-only source and installed package checks",
     "4000-workspace 25000/100000-session fixture and hidden-row query work bound"
   ],
-  "rebuildHandshake": "Host-owned durable unavailable fence; immutable stable-URI paged snapshot; reconstruct identities; checkpoint0 replay in max100 contiguous projection sequence batches with exact epoch/page commands; reconcile original receipts; drain subsequent changes; release only after final checkpoint and row-count manifest verify. README is normative for host handshake."
+  "rebuildHandshake": "Host-owned durable unavailable fence; immutable stable-URI paged snapshot; reconstruct identities; checkpoint0 replay in max100 contiguous projection sequence batches with exact epoch/page commands; reconcile original receipts; drain subsequent changes; release only after final checkpoint and row-count manifest verify. README is normative for host handshake.",
+  "indexContinuity": {
+    "storage": "Transactional insert-if-absent dedicated index-incarnation key in existing progress; no new table, checkpoint, ledger or ready bit",
+    "retention": "Reopen, discovery and in-place schema migration preserve identity; a new or recreated database gets a different UUID. Legacy metadata migration adds identity without changing rows/checkpoints/receipts or granting Host readiness.",
+    "consumers": "Host acknowledgment belongs only in existing Host authority at its verified qualification boundary. Old Catalog missing additive fields uses the old qualified path with no invented acknowledgment; old Host keeps its existing gating. This Catalog slice does not implement retained-browse admission.",
+    "limits": "File copy/backup restore retains the UUID and cannot certify rollback freshness. Restore requires owner fencing and requalification. Live database file replacement while Catalog is serving is unsupported: stop owners and reopen/requalify; surrounding status reads do not prove page origin under arbitrary A-B-A replacement."
+  }
 }

@@ -375,8 +375,16 @@ changed command content and stale checkpoints refuse the entire batch.
 
 The transaction atomically applies rows, its source checkpoint and an exact
 projection receipt. The result is `{source,commandId,revision,projected}`.
-`sessionVisibilityProjectionStatus({source})` returns `{source,revision}` (zero
-before any batch). `sessionVisibilityProjectionReceipt({source,commandId})`
+`sessionVisibilityProjectionStatus({source})` returns
+`{source,revision,indexIncarnation,projectionPresent}`. `source` echoes the requested
+owner selector; `revision` is its persisted checkpoint or zero when absent.
+`projectionPresent` is computed from actual source-row presence, not persisted as
+a second state flag. The projection API does not produce a present zero checkpoint.
+`indexIncarnation` is a canonical UUID inserted transactionally once under the
+`index-incarnation` key in existing progress metadata. Reopen, scans and in-place
+schema migration preserve it. Status reads identity and checkpoint in one SQLite
+statement/snapshot from the actual handle, and refuses missing/corrupt identity
+rather than repairing it. `sessionVisibilityProjectionReceipt({source,commandId})`
 returns the original result or null without writing. An exact command retry
 returns its original result even after restart or a newer batch; it never repeats
 an older visibility change. A URI belongs to its first projection source, including
@@ -407,6 +415,30 @@ restarts; changes require an explicit migration, not a guessed new owner. Catalo
 projection receipts are rebuildable index evidence, not the host's reset journals.
 Source and independently installed component tests do not qualify the host reset
 transaction, client controls, browser/device/account behavior or live adoption.
+
+#### Index continuity and compatibility
+
+Creating or recreating a database creates a new identity. Adding this metadata to
+a legacy database preserves its rows, checkpoints, receipts and progress; it does
+not prove initialization, reconstruction or Host readiness. No projection batch
+or checkpoint is manufactured to establish identity. A future paired Host can
+acknowledge the exact incarnation in its existing authority only at a verified
+qualification boundary, then use that acknowledgment and settled visibility
+facts for retained reads during refresh. This Catalog change does not implement
+that browse admission or change full discovery, directory observations, hint
+coverage, mutation eligibility or the existing rebuild fence.
+
+Older Catalog peers without these fields use the existing qualified path; callers
+must not invent an acknowledgment. Older Hosts retain their existing gating.
+These fields extend only the trusted local component interface, not AHP/ACP.
+
+A database copy or restored backup retains its stored UUID. Identity detects a
+different/recreated index, not arbitrary rollback to a same-UUID backup; restore
+requires owner fencing and requalification. Live file replacement while Catalog
+is serving is unsupported: stop owners, replace, reopen and requalify. Identity
+is read from the SQLite handle, but a leased handle may still refer to its original
+file. Two surrounding status reads do not establish a page's origin under an
+arbitrary replacement and reversal during the read.
 
 #### Host snapshot/rebuild handshake
 

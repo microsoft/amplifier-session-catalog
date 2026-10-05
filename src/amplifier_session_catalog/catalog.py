@@ -187,6 +187,10 @@ class Catalog:
                 CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version=1;
             """)
+            # Database continuity is independent from discovery or projection.
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("INSERT OR IGNORE INTO progress VALUES('index-incarnation',?)",
+                       (json.dumps(str(uuid.uuid4())),))
         with self.connect() as db:
             db.executescript("""
                 CREATE INDEX IF NOT EXISTS library_created ON sessions(visible,kind,created_at DESC,uri);
@@ -615,8 +619,17 @@ class Catalog:
     def session_visibility_projection_status(self, *, source):
         checked_string(source, 'source', 200)
         with self.connect() as db:
-            row = db.execute('SELECT revision FROM product_visibility_projection WHERE source=?', (source,)).fetchone()
-        return {'source': source, 'revision': row['revision'] if row else 0}
+            row = db.execute("""SELECT p.value, v.revision FROM progress p
+                LEFT JOIN product_visibility_projection v ON v.source=?
+                WHERE p.key='index-incarnation'""", (source,)).fetchone()
+            try:
+                incarnation = json.loads(row['value']) if row else None
+                if not isinstance(incarnation,str) or str(uuid.UUID(incarnation))!=incarnation:
+                    raise ValueError('Invalid index incarnation')
+            except (ValueError,TypeError,AttributeError) as exc:
+                raise ValueError('Catalog index incarnation is unavailable or invalid') from exc
+        return {'source': source, 'revision': row['revision'] if row['revision'] is not None else 0,
+                'indexIncarnation': incarnation, 'projectionPresent': row['revision'] is not None}
 
     def session_visibility_projection_receipt(self, *, source, commandId):
         checked_string(source, 'source', 200)
