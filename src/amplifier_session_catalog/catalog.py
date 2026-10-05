@@ -122,6 +122,7 @@ class Catalog:
         self.secret = secrets.token_bytes(32)
         self.library_lock = threading.RLock()
         self.library_guards = OrderedDict()
+        self._connection_owner = threading.local()
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, 1):
@@ -204,40 +205,76 @@ class Catalog:
         os.chmod(self.path, 0o600)
 
     @contextmanager
-    def connect(self):
+    def connection_scope(self):
+        """Reuse a handle only within this thread's bounded request or scan.
+
+        No transaction spans the scope: connect() retains its own commit/rollback
+        boundary. Close on the same owner thread, even when source work fails.
+        """
+        previous=getattr(self._connection_owner,'scope',None)
+        if previous is not None:
+            yield
+            return
+        owner={'connection':None,'leased':False}
+        self._connection_owner.scope=owner
+        try:
+            yield
+        finally:
+            del self._connection_owner.scope
+            if owner['connection'] is not None:
+                owner['connection']['db'].close()
+
+    def _open_connection(self):
         db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        events = set()
-        overflow = False
-        def changed(workspace, fields):
-            nonlocal overflow
-            if len(events)<256: events.add((workspace,fields))
-            else: overflow=True
-            return 0
-        db.create_function('library_changed',2,changed)
-        if db.execute("SELECT 1 FROM sqlite_master WHERE name='sessions'").fetchone():
-            db.executescript("""
-                CREATE TEMP TRIGGER library_insert AFTER INSERT ON main.sessions BEGIN SELECT library_changed(NEW.workspace,'membership'); END;
-                CREATE TEMP TRIGGER library_delete AFTER DELETE ON main.sessions BEGIN SELECT library_changed(OLD.workspace,'membership'); END;
-                CREATE TEMP TRIGGER library_membership AFTER UPDATE ON main.sessions WHEN OLD.visible<>NEW.visible OR OLD.kind<>NEW.kind OR OLD.workspace<>NEW.workspace OR OLD.parent_uri IS NOT NEW.parent_uri OR OLD.native_id<>NEW.native_id OR json_extract(OLD.details,'$.location') IS NOT json_extract(NEW.details,'$.location') BEGIN SELECT library_changed(OLD.workspace,'membership'); SELECT library_changed(NEW.workspace,'membership'); END;
-                CREATE TEMP TRIGGER library_title AFTER UPDATE OF title ON main.sessions WHEN OLD.title<>NEW.title BEGIN SELECT library_changed(NEW.workspace,'title'); END;
-                CREATE TEMP TRIGGER library_activity AFTER UPDATE OF modified_at ON main.sessions WHEN OLD.modified_at<>NEW.modified_at BEGIN SELECT library_changed(NEW.workspace,'activity'); END;
-                CREATE TEMP TRIGGER library_created AFTER UPDATE OF created_at ON main.sessions WHEN OLD.created_at<>NEW.created_at BEGIN SELECT library_changed(NEW.workspace,'created'); END;
-                CREATE TEMP TRIGGER library_effect AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.effect') IS NOT json_extract(NEW.details,'$.hostObservation.effect') BEGIN SELECT library_changed(NEW.workspace,'effect'); END;
-                CREATE TEMP TRIGGER library_archive_insert AFTER INSERT ON main.session_archive BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
-                CREATE TEMP TRIGGER library_archive_update AFTER UPDATE ON main.session_archive WHEN OLD.archived<>NEW.archived BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
-                CREATE TEMP TRIGGER library_workspace AFTER UPDATE ON main.workspace_index WHEN OLD.name<>NEW.name OR OLD.hidden<>NEW.hidden OR OLD.availability<>NEW.availability BEGIN SELECT library_changed(NEW.path,'membership'); END;
-            """)
+        try:
+            db.row_factory = sqlite3.Row
+            state={'db':db,'events':set(),'overflow':False}
+            def changed(workspace, fields):
+                if len(state['events'])<256: state['events'].add((workspace,fields))
+                else: state['overflow']=True
+                return 0
+            db.create_function('library_changed',2,changed)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='sessions'").fetchone():
+                db.executescript("""
+                    CREATE TEMP TRIGGER library_insert AFTER INSERT ON main.sessions BEGIN SELECT library_changed(NEW.workspace,'membership'); END;
+                    CREATE TEMP TRIGGER library_delete AFTER DELETE ON main.sessions BEGIN SELECT library_changed(OLD.workspace,'membership'); END;
+                    CREATE TEMP TRIGGER library_membership AFTER UPDATE ON main.sessions WHEN OLD.visible<>NEW.visible OR OLD.kind<>NEW.kind OR OLD.workspace<>NEW.workspace OR OLD.parent_uri IS NOT NEW.parent_uri OR OLD.native_id<>NEW.native_id OR json_extract(OLD.details,'$.location') IS NOT json_extract(NEW.details,'$.location') BEGIN SELECT library_changed(OLD.workspace,'membership'); SELECT library_changed(NEW.workspace,'membership'); END;
+                    CREATE TEMP TRIGGER library_title AFTER UPDATE OF title ON main.sessions WHEN OLD.title<>NEW.title BEGIN SELECT library_changed(NEW.workspace,'title'); END;
+                    CREATE TEMP TRIGGER library_activity AFTER UPDATE OF modified_at ON main.sessions WHEN OLD.modified_at<>NEW.modified_at BEGIN SELECT library_changed(NEW.workspace,'activity'); END;
+                    CREATE TEMP TRIGGER library_created AFTER UPDATE OF created_at ON main.sessions WHEN OLD.created_at<>NEW.created_at BEGIN SELECT library_changed(NEW.workspace,'created'); END;
+                    CREATE TEMP TRIGGER library_effect AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.effect') IS NOT json_extract(NEW.details,'$.hostObservation.effect') BEGIN SELECT library_changed(NEW.workspace,'effect'); END;
+                    CREATE TEMP TRIGGER library_archive_insert AFTER INSERT ON main.session_archive BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
+                    CREATE TEMP TRIGGER library_archive_update AFTER UPDATE ON main.session_archive WHEN OLD.archived<>NEW.archived BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
+                    CREATE TEMP TRIGGER library_workspace AFTER UPDATE ON main.workspace_index WHEN OLD.name<>NEW.name OR OLD.hidden<>NEW.hidden OR OLD.availability<>NEW.availability BEGIN SELECT library_changed(NEW.path,'membership'); END;
+                """)
+            return state
+        except BaseException:
+            db.close()
+            raise
+
+    @contextmanager
+    def connect(self):
+        owner=getattr(self._connection_owner,'scope',None)
+        # Nested connection calls keep their original independent semantics;
+        # they must not commit an outer source publication transaction.
+        reused=owner is not None and not owner['leased']
+        if reused:
+            if owner['connection'] is None:owner['connection']=self._open_connection()
+            state=owner['connection'];owner['leased']=True
+        else:
+            state=self._open_connection()
+        db=state['db']
+        state['events'].clear();state['overflow']=False
         try:
             yield db
             with self.library_lock:
                 db.commit()
                 for guard in self.library_guards.values():
-                    if overflow:
+                    if state['overflow']:
                         guard['dirty']=True
                         continue
                     q=guard['query']
-                    for workspace,fields in events:
+                    for workspace,fields in state['events']:
                         if q.get('workingDirectory') and q['workingDirectory']!=workspace: continue
                         if not any(workspace==r or workspace.startswith(r.rstrip('/')+'/') for r in [*q['allowedWorkspaceRoots'],*(q.get('allowedManagedRoots') or [])]): continue
                         if fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
@@ -247,7 +284,9 @@ class Catalog:
             db.rollback()
             raise
         finally:
-            db.close()
+            state['events'].clear();state['overflow']=False
+            if reused:owner['leased']=False
+            else:db.close()
 
     @staticmethod
     def workspace_id(path):

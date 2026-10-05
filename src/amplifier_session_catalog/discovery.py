@@ -150,9 +150,10 @@ class Discovery:
 
     def hint(self, sessionDirectory, *, run=None, force=False, _read_json=None):
         """Read current facts after a writer hint; never trust hinted metadata."""
-        try:return self._hint(sessionDirectory, run=run, force=force, _read_json=_read_json)
-        except StalePublication:
-            return {'changed':False,'issues':['Selected source or indexed row changed before publication']}
+        with self.catalog.connection_scope():
+            try:return self._hint(sessionDirectory, run=run, force=force, _read_json=_read_json)
+            except StalePublication:
+                return {'changed':False,'issues':['Selected source or indexed row changed before publication']}
 
     def _hint_for_inbox(self, sessionDirectory):
         # Not registered as RPC. Public hints retain their existing result shape.
@@ -160,10 +161,11 @@ class Discovery:
         # It also prevents a newer candidate losing recovery when a successful
         # competitor consumed their shared claim. Native/lifecycle read failures
         # still retain the claim for a later batch, without an inline retry.
-        for attempt in range(2):
-            try:return self._hint(sessionDirectory,retry_transient=True)
-            except StalePublication:
-                if attempt:raise
+        with self.catalog.connection_scope():
+            for attempt in range(2):
+                try:return self._hint(sessionDirectory,retry_transient=True)
+                except StalePublication:
+                    if attempt:raise
 
     def _hint(self, sessionDirectory, *, run=None, force=False, _read_json=None, retry_transient=False):
         if len(self.app_homes)>16:raise ValueError('Selected source adapter limit exceeds16')
@@ -581,6 +583,10 @@ class Discovery:
             raise
 
     def scan(self):
+        with self.catalog.connection_scope():
+            return self._scan()
+
+    def _scan(self):
         if not self._lock.acquire(blocking=False):
             return self.catalog.progress()
         run = str(uuid.uuid4())
