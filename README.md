@@ -615,3 +615,10 @@ indexed sorting, literal search and observed activity before bounded pages.
 runtime unknown is separate from retained uncertain effects. Current Host facts
 are bounded and observations carry explicit freshness. No current global totals,
 frozen pages, native history reads or worker initialization are implied.
+
+Missing ordinary workspace folders can be discovered with the explicitly negotiated
+`libraryCapabilities.missingWorkspaceHistory.version: 1` and `location: "missing"`
+library selector. The default library remains unchanged. This metadata-only view
+retains independent hidden, deleted, source-presence, archive and access exclusions;
+it does not authorize execution or relocate history. See
+[the owner contract](contracts/missing-workspace-discovery.v1.md).

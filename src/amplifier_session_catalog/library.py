@@ -12,7 +12,7 @@ def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cur
                   liveFacts=None, observationFreshness=None):
     checked_string(connectionId,'connectionId',200)
     if type(limit) is not int or not 1<=limit<=50: raise ValueError('Library limit must be1..50')
-    if sort not in {'activity','created','name'} or activity not in {'all','working','attention'} or location not in {'all','managed'} or archive not in {'active','all','archived'}: raise ValueError('Invalid library selector')
+    if sort not in {'activity','created','name'} or activity not in {'all','working','attention'} or location not in {'all','managed','missing'} or archive not in {'active','all','archived'}: raise ValueError('Invalid library selector')
     if not isinstance(allowedWorkspaceRoots,list) or len(allowedWorkspaceRoots)>128: raise ValueError('Explicit bounded workspace grants required')
     roots=sorted(set(checked_string(r,'workspace root').rstrip('/') or '/' for r in allowedWorkspaceRoots))
     managed=managed_roots(allowedManagedRoots)
@@ -34,7 +34,17 @@ def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cur
     for issue in freshness['issues']: checked_string(issue,'freshness issue',200)
     query=dict(connectionId=connectionId,allowedWorkspaceRoots=roots,allowedManagedRoots=managed,workingDirectory=workingDirectory,search=search,parentUri=parentUri,archive=archive,sort=sort,activity=activity,location=location,source=facts['source'],incarnation=facts['incarnation'])
     scope=hashlib.sha256(json.dumps(query,sort_keys=True).encode()).hexdigest()
-    where=['s.visible=1',"s.kind='child' AND s.parent_uri=?" if parentUri else "s.kind='root'"]
+    visibility = 's.visible=1'
+    if location == 'missing':
+        # Explicit recovery discovery relaxes only the present-folder condition.
+        # Every independent exclusion remains in force before paging.
+        visibility = """w.availability='missing'
+            AND NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.uri=s.uri)
+            AND NOT EXISTS(SELECT 1 FROM workspace_index hidden_workspace WHERE hidden_workspace.path=s.workspace AND hidden_workspace.hidden=1)
+            AND NOT EXISTS(SELECT 1 FROM native_visibility nv WHERE nv.uri=s.uri AND nv.deleted=1)
+            AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=s.uri AND pv.hidden=1)
+            AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=s.uri AND sp.storage_path=s.storage_path AND sp.missing=1)"""
+    where=[visibility,"s.kind='child' AND s.parent_uri=?" if parentUri else "s.kind='root'"]
     args=[parentUri] if parentUri else []
     auth,grants=authorized_scope(roots,managed);where.append(auth);args+=grants
     if workingDirectory: where.append('s.workspace=?');args.append(workingDirectory)
