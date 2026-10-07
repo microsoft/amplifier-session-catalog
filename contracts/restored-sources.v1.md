@@ -34,3 +34,13 @@ owner-authoritative mappings; a history-home rebind cannot infer them.
 Qualification must include same-URI discovery after a physical restore, child
 relationships, exact retries, conflicts, atomic failures, retained visibility and
 unknown observations, plus a signed full-installation resume with no work replay.
+
+The offline `rebind_restored_home` wrapper records a bounded plan of at most
+100,000 source snapshots and applies batches of 100 through the same interface.
+After interruption it reuses the recorded snapshots and command IDs, including
+already-committed batches. It does not rediscover or silently skip moved rows.
+Partial failures leave the copied index inactive for inspection. An empty home
+is a valid zero-row projection. The local operator command is
+`python -m amplifier_session_catalog.restore --db /private/copied.sqlite --request /private/request.json`.
+The private request contains only `command_id`, `restore_digest`, `source_home`
+and `destination_home`. This command is deliberately absent from catalog RPC.

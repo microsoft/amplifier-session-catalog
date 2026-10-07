@@ -7,6 +7,7 @@ import pytest
 from amplifier_session_catalog import Catalog
 from amplifier_session_catalog.discovery import Discovery
 from amplifier_session_catalog.restore import rebind_restored_sources
+from amplifier_session_catalog.restore import rebind_restored_home
 from test_source_presence import fixture
 
 
@@ -102,3 +103,33 @@ def test_restore_rejects_unbounded_or_unproven_inputs(tmp_path, records):
     c, d, uri, child, source, destination, args = prepare(tmp_path)
     with pytest.raises(ValueError):
         rebind_restored_sources(c, **{**args, 'records': records})
+
+
+def test_whole_home_reuses_saved_batches_after_interruption(tmp_path, monkeypatch):
+    import amplifier_session_catalog.restore as module
+    c, d, uri, child, source, destination, args = prepare(tmp_path)
+    original = c.get(uri)
+    for i in range(105):
+        name = 'extra-' + str(i)
+        c.upsert({**original, 'uri': 'ahp-session:/' + name, 'nativeSessionId': name,
+                  'storagePath': str(Path(original['storagePath']).parent / name)})
+    request = {k: v for k, v in args.items() if k != 'records'}
+    actual = module.rebind_restored_sources
+    calls = 0
+    def interrupted(*a, **kw):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError('lost between batches')
+        return actual(*a, **kw)
+    monkeypatch.setattr(module, 'rebind_restored_sources', interrupted)
+    with pytest.raises(RuntimeError, match='lost between'):
+        rebind_restored_home(c, **request)
+    monkeypatch.setattr(module, 'rebind_restored_sources', actual)
+    result = rebind_restored_home(c, **request)
+    assert result['rebound'] == 107 and result['batches'] == 2
+    assert rebind_restored_home(c, **request) == result
+    with pytest.raises(ValueError, match='different arguments'):
+        rebind_restored_home(c, **{**request, 'restore_digest': 'b' * 64})
+    with c.connect() as db:
+        assert all(row[0].startswith(str(destination) + '/') for row in db.execute('SELECT storage_path FROM sessions'))

@@ -90,3 +90,77 @@ def rebind_restored_sources(catalog, *, command_id, restore_digest, source_home,
         db.execute('INSERT INTO restored_source_commands VALUES(?,?,?)',
                    (command_id, signature, json.dumps(result)))
         return result
+
+
+def rebind_restored_home(catalog, *, command_id, restore_digest, source_home, destination_home):
+    """Plan and resume bounded batches on a stopped, copied index.
+
+    A lost acknowledgement reuses the original snapshots and batch commands.
+    This is a local operator interface; the caller owns native verification and
+    writer exclusion. It cannot launch workers or authorize activation.
+    """
+    checked_string(command_id, 'restore projection command', 160)
+    source, destination = _home(source_home), _home(destination_home)
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError('Restore homes must be distinct and disjoint')
+    if not isinstance(restore_digest, str) or not re.fullmatch('[a-f0-9]{64}', restore_digest):
+        raise ValueError('Verified restore receipt digest required')
+    signature = hashlib.sha256(json.dumps([restore_digest, source_home, destination_home],
+                                         separators=(',', ':')).encode()).hexdigest()
+    with catalog.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('CREATE TABLE IF NOT EXISTS restored_home_commands '
+                   '(command_id TEXT PRIMARY KEY, signature TEXT NOT NULL, records TEXT NOT NULL)')
+        previous = db.execute('SELECT signature,records FROM restored_home_commands WHERE command_id=?',
+                              (command_id,)).fetchone()
+        if previous:
+            if previous['signature'] != signature:
+                raise ValueError('Restore projection command has different arguments')
+            records = json.loads(previous['records'])
+        else:
+            prefix = source_home + '/projects/'
+            rows = db.execute('SELECT uri,storage_path FROM sessions WHERE substr(storage_path,1,?)=? '
+                              'ORDER BY uri LIMIT 100001', (len(prefix), prefix)).fetchall()
+            if len(rows) > 100000:
+                raise ValueError('Restored home exceeds the bounded projection limit')
+            records = [{'uri': row['uri'], 'token': catalog._source_snapshot(row['storage_path'], db=db)['token']}
+                       for row in rows]
+            db.execute('INSERT INTO restored_home_commands VALUES(?,?,?)',
+                       (command_id, signature, json.dumps(records)))
+    count = 0
+    for offset in range(0, len(records), 100):
+        result = rebind_restored_sources(catalog, command_id=command_id + ':' + str(offset // 100),
+                                        restore_digest=restore_digest, source_home=source_home,
+                                        destination_home=destination_home, records=records[offset:offset + 100])
+        count += result['rebound']
+    return {'commandId': command_id, 'restoreDigest': restore_digest, 'rebound': count,
+            'batches': (len(records) + 99) // 100, 'nativeFilesModified': False}
+
+
+def main():
+    """Offline local CLI; deliberately absent from the catalog RPC surface."""
+    import argparse
+    import stat
+    from .catalog import Catalog
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument('--db', required=True)
+    parser.add_argument('--request', required=True)
+    args = parser.parse_args()
+    for name in (args.db, args.request):
+        path = Path(name)
+        info = path.lstat()
+        if (not path.is_absolute() or path.resolve() != path or not stat.S_ISREG(info.st_mode)
+                or info.st_mode & 0o077 or info.st_uid != os.getuid()):
+            raise ValueError('Private canonical existing operator files required')
+    with open(args.request, 'rb') as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError('Restore projection request exceeds limit')
+    request = json.loads(raw)
+    if not isinstance(request, dict) or set(request) != {'command_id', 'restore_digest', 'source_home', 'destination_home'}:
+        raise ValueError('Exact restore projection request required')
+    print(json.dumps(rebind_restored_home(Catalog(args.db), **request)))
+
+
+if __name__ == '__main__':
+    main()
