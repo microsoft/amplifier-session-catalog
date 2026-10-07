@@ -17,7 +17,7 @@ class Server:
     def __init__(self, catalog, discovery):
         self.catalog = catalog
         self.discovery = discovery
-        self.methods = {"libraryCapabilities": lambda: {"version":1,"paging":"live","maxPage":50,"maxLiveFacts":64,"counts":False}, "libraryQuery": catalog.library_query, "list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
+        self.methods = {"libraryCapabilities": lambda: {"version":1,"paging":"live","maxPage":50,"maxLiveFacts":64,"counts":False,"missingWorkspaceHistory":{"version":1}}, "libraryQuery": catalog.library_query, "list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
                         "verifyFamily": discovery.verify_family, "reconcileFamily": discovery.reconcile_family, "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
