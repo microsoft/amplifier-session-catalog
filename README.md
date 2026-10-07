@@ -8,6 +8,10 @@ A rebuildable SQLite index for workspace and native session discovery. It never
 loads an agent, imports Amplifier's kernel, reads event/transcript contents, or
 writes native history. Interactive list/get operations query the index only.
 
+Verified inactive installation restores may use the offline
+[restored source binding projection](contracts/restored-sources.v1.md) before
+starting discovery. Ordinary hints cannot move an existing binding.
+
 Default lists contain root conversations in confirmed existing workspace
 directories. Child discovery is explicit; independent CLI forks remain roots.
 Unknown/inaccessible directories remain distinct from confirmed missing paths.
