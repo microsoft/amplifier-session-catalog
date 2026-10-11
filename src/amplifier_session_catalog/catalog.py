@@ -829,6 +829,21 @@ class Catalog:
             row = db.execute("SELECT uri,fingerprint,EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1) AS source_missing FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
         return dict(row) if row else None
 
+    def workspace_cleanup_census(self):
+        """Cold maintenance metadata only; never a claim about external writers."""
+        with self.connect() as db:
+            rows = [dict(row) for row in db.execute(
+                'SELECT uri,engine,native_id,workspace,storage_path,parent_uri,kind FROM sessions ORDER BY uri LIMIT 10001')]
+        if len(rows) > 10000:
+            raise ValueError('Workspace cleanup census exceeds the bounded index capacity')
+        import hashlib
+        revision = hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return {'version': 1, 'coverage': 'indexed-metadata-only', 'revision': revision,
+                'transcriptBodiesRead': False, 'externalWriterCoverage': False,
+                'items': [{'uri': r['uri'], 'engineId': r['engine'], 'nativeSessionId': r['native_id'],
+                           'workingDirectory': r['workspace'], 'storagePath': r['storage_path'],
+                           'parentUri': r['parent_uri'], 'kind': r['kind']} for r in rows]}
+
     def directory_in_use(self, *, path):
         """Indexed historical references, not a lease on external agent writers.
 

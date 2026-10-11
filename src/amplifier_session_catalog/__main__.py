@@ -17,14 +17,14 @@ class Server:
     def __init__(self, catalog, discovery):
         self.catalog = catalog
         self.discovery = discovery
-        self.methods = {"libraryCapabilities": lambda: {"version":1,"paging":"live","maxPage":50,"maxLiveFacts":64,"counts":False,"workspaceArchive":{"version":1},"missingWorkspaceHistory":{"version":1},"navigation":{"version":1}}, "libraryQuery": catalog.library_query, "list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
+        self.methods = {"libraryCapabilities": lambda: {"version":1,"paging":"live","maxPage":50,"maxLiveFacts":64,"counts":False,"workspaceCleanupCensus":{"version":1},"workspaceArchive":{"version":1},"missingWorkspaceHistory":{"version":1},"navigation":{"version":1}}, "libraryQuery": catalog.library_query, "list": catalog.list, "get": catalog.get, "upsert": catalog.upsert, "claimNative": catalog.claim_native,
                         "workspace": catalog.workspace, "projectSessionArchives":catalog.project_session_archives, "listWorkspaces": catalog.list_workspaces, "getWorkspace": catalog.get_workspace,
                         "projectWorkspaces": catalog.project_workspaces, "workspaceProjectionStatus": catalog.workspace_projection_status, "recheck": catalog.recheck_workspaces,
                         "verifyFamily": discovery.verify_family, "reconcileFamily": discovery.reconcile_family, "hint": discovery.hint, "scan": discovery.start, "status": catalog.progress,
                         "projectSessionVisibility": catalog.project_session_visibility,
                         "sessionVisibilityProjectionStatus": catalog.session_visibility_projection_status,
                         "sessionVisibilityProjectionReceipt": catalog.session_visibility_projection_receipt,
-                        "setVisibility": catalog.set_visibility, "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use,
+                        "setVisibility": catalog.set_visibility, "resolveNative": catalog.resolve_native, "directoryInUse": catalog.directory_in_use, "workspaceCleanupCensus": catalog.workspace_cleanup_census,
                         "retentionCandidates":catalog.retention_candidates,"descendants":catalog.descendants}
 
     def handle(self, request):

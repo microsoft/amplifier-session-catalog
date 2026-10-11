@@ -166,6 +166,17 @@ There is no guessed user home. Invalid markers retain previous visibility and
 produce an issue. A confirmed native restore marker or receipt re-enables the
 row; an absent marker is not restore evidence.
 
+## Optional workspace cleanup census (v1)
+
+`libraryCapabilities.workspaceCleanupCensus.version=1` advertises the trusted
+`workspaceCleanupCensus({})` metadata operation. It returns every indexed
+identity and location (including hidden, child, internal, and archived records),
+a revision hash, and explicit `indexed-metadata-only` coverage. More than 10,000
+rows refuse the operation; no partial census is returned. It performs no source
+discovery or transcript reads and makes no assertion about external writers.
+The Host combines these facts with its own mappings under coordinated recovery
+holds. Native filesystem deletion and product archival remain separately owned.
+
 ## Optional writer hint inbox (v1)
 
 Writers which cannot reach the live catalog process may opt into a private local
