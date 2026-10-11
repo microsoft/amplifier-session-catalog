@@ -8,6 +8,10 @@ A rebuildable SQLite index for workspace and native session discovery. It never
 loads an agent, imports Amplifier's kernel, reads event/transcript contents, or
 writes native history. Interactive list/get operations query the index only.
 
+Verified inactive installation restores may use the offline
+[restored source binding projection](contracts/restored-sources.v1.md) before
+starting discovery. Ordinary hints cannot move an existing binding.
+
 Default lists contain root conversations in confirmed existing workspace
 directories. Child discovery is explicit; independent CLI forks remain roots.
 Unknown/inaccessible directories remain distinct from confirmed missing paths.
@@ -161,6 +165,17 @@ read only bounded, identity-matching markers, never transcript/event bodies.
 There is no guessed user home. Invalid markers retain previous visibility and
 produce an issue. A confirmed native restore marker or receipt re-enables the
 row; an absent marker is not restore evidence.
+
+## Optional workspace cleanup census (v1)
+
+`libraryCapabilities.workspaceCleanupCensus.version=1` advertises the trusted
+`workspaceCleanupCensus({})` metadata operation. It returns every indexed
+identity and location (including hidden, child, internal, and archived records),
+a revision hash, and explicit `indexed-metadata-only` coverage. More than 10,000
+rows refuse the operation; no partial census is returned. It performs no source
+discovery or transcript reads and makes no assertion about external writers.
+The Host combines these facts with its own mappings under coordinated recovery
+holds. Native filesystem deletion and product archival remain separately owned.
 
 ## Optional writer hint inbox (v1)
 
@@ -611,3 +626,10 @@ indexed sorting, literal search and observed activity before bounded pages.
 runtime unknown is separate from retained uncertain effects. Current Host facts
 are bounded and observations carry explicit freshness. No current global totals,
 frozen pages, native history reads or worker initialization are implied.
+
+Missing ordinary workspace folders can be discovered with the explicitly negotiated
+`libraryCapabilities.missingWorkspaceHistory.version: 1` and `location: "missing"`
+library selector. The default library remains unchanged. This metadata-only view
+retains independent hidden, deleted, source-presence, archive and access exclusions;
+it does not authorize execution or relocate history. See
+[the owner contract](contracts/missing-workspace-discovery.v1.md).

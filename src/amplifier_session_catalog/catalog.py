@@ -139,6 +139,7 @@ class Catalog:
                     revision INTEGER NOT NULL DEFAULT 0,source TEXT
                 );
                 CREATE INDEX IF NOT EXISTS available_workspace_order ON workspace_index(availability,hidden,sort_name,path);
+                CREATE TABLE IF NOT EXISTS workspace_archives(path TEXT PRIMARY KEY,archived INTEGER NOT NULL CHECK(archived IN (0,1)));
                 CREATE TABLE IF NOT EXISTS workspace_projection (source TEXT PRIMARY KEY,revision INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS sessions (
                     uri TEXT PRIMARY KEY, engine TEXT NOT NULL, native_id TEXT NOT NULL,
@@ -193,6 +194,9 @@ class Catalog:
                        (json.dumps(str(uuid.uuid4())),))
         with self.connect() as db:
             db.executescript("""
+                CREATE INDEX IF NOT EXISTS library_recent ON sessions(visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
+                CREATE INDEX IF NOT EXISTS library_human_recent ON sessions(visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.agentCreated'),0),coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
+                CREATE INDEX IF NOT EXISTS library_workspace_recent ON sessions(workspace,visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
                 CREATE INDEX IF NOT EXISTS library_created ON sessions(visible,kind,created_at DESC,uri);
                 CREATE INDEX IF NOT EXISTS library_name ON sessions(visible,kind,lower(title),uri);
                 CREATE INDEX IF NOT EXISTS library_attention_activity ON sessions(visible,kind,modified_at DESC,uri) WHERE coalesce(json_extract(details,'$.hostObservation.effect'),'unverified') IN ('error','unknown');
@@ -245,6 +249,8 @@ class Catalog:
                     CREATE TEMP TRIGGER library_membership AFTER UPDATE ON main.sessions WHEN OLD.visible<>NEW.visible OR OLD.kind<>NEW.kind OR OLD.workspace<>NEW.workspace OR OLD.parent_uri IS NOT NEW.parent_uri OR OLD.native_id<>NEW.native_id OR json_extract(OLD.details,'$.location') IS NOT json_extract(NEW.details,'$.location') BEGIN SELECT library_changed(OLD.workspace,'membership'); SELECT library_changed(NEW.workspace,'membership'); END;
                     CREATE TEMP TRIGGER library_title AFTER UPDATE OF title ON main.sessions WHEN OLD.title<>NEW.title BEGIN SELECT library_changed(NEW.workspace,'title'); END;
                     CREATE TEMP TRIGGER library_activity AFTER UPDATE OF modified_at ON main.sessions WHEN OLD.modified_at<>NEW.modified_at BEGIN SELECT library_changed(NEW.workspace,'activity'); END;
+                    CREATE TEMP TRIGGER library_recent AFTER UPDATE ON main.sessions WHEN coalesce(json_extract(OLD.details,'$.hostObservation.navigation.activityAt'),OLD.modified_at) IS NOT coalesce(json_extract(NEW.details,'$.hostObservation.navigation.activityAt'),NEW.modified_at) BEGIN SELECT library_changed(NEW.workspace,'recent'); END;
+                    CREATE TEMP TRIGGER library_agent_created AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.navigation.agentCreated') IS NOT json_extract(NEW.details,'$.hostObservation.navigation.agentCreated') BEGIN SELECT library_changed(NEW.workspace,'agent-created'); END;
                     CREATE TEMP TRIGGER library_created AFTER UPDATE OF created_at ON main.sessions WHEN OLD.created_at<>NEW.created_at BEGIN SELECT library_changed(NEW.workspace,'created'); END;
                     CREATE TEMP TRIGGER library_effect AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.effect') IS NOT json_extract(NEW.details,'$.hostObservation.effect') BEGIN SELECT library_changed(NEW.workspace,'effect'); END;
                     CREATE TEMP TRIGGER library_archive_insert AFTER INSERT ON main.session_archive BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
@@ -281,7 +287,7 @@ class Catalog:
                     for workspace,fields in state['events']:
                         if q.get('workingDirectory') and q['workingDirectory']!=workspace: continue
                         if not any(workspace==r or workspace.startswith(r.rstrip('/')+'/') for r in [*q['allowedWorkspaceRoots'],*(q.get('allowedManagedRoots') or [])]): continue
-                        if fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
+                        if fields=='recent' and q['sort']=='recent' or fields=='agent-created' and q.get('navigationVersion')==1 and not q.get('includeAgentCreated') or fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
                             guard['dirty']=True
                             break
         except BaseException:
@@ -460,8 +466,11 @@ class Catalog:
             observation = json.loads(previous['details']).get('hostObservation') if previous else None
             if source == 'host' and 'hostObservation' in record:
                 candidate = record['hostObservation']
-                if not isinstance(candidate,dict) or set(candidate)!={'version','source','incarnation','revision','observedAt','effect','unknownChecked'} or type(candidate['version']) is not int or candidate['version']!=1 or type(candidate['revision']) is not int or candidate['revision']<0 or candidate['effect'] not in {'unverified','settled','error','unknown'} or candidate['unknownChecked'] is not True:
+                if not isinstance(candidate,dict) or set(candidate)-{'version','source','incarnation','revision','observedAt','effect','unknownChecked','navigation'} or not {'version','source','incarnation','revision','observedAt','effect','unknownChecked'}<=set(candidate) or type(candidate['version']) is not int or candidate['version']!=1 or type(candidate['revision']) is not int or candidate['revision']<0 or candidate['effect'] not in {'unverified','settled','error','unknown'} or candidate['unknownChecked'] is not True:
                     raise ValueError('Invalid checked Host observation')
+                if 'navigation' in candidate:
+                    from .library import checked_navigation
+                    checked_navigation(candidate['navigation'])
                 for key in ('source','incarnation','observedAt'): checked_string(candidate[key],key,200)
                 if timestamp(candidate['observedAt'],-1)<0:raise ValueError('Invalid observation time')
                 if observation and observation['source']!=candidate['source']: raise ValueError('Host observation belongs to another source')
@@ -712,17 +721,18 @@ class Catalog:
     @staticmethod
     def _workspace_record(row):
         return {"id":row["id"],"path":row["path"],"name":row["name"],"available":row["availability"]=="present",
-                "availability":row["availability"],"registered":bool(row["registered"]),"hidden":bool(row["hidden"]),
+                "archived":bool(row["archived"]),"availability":row["availability"],"registered":bool(row["registered"]),"hidden":bool(row["hidden"]),
                 "revision":row["revision"],"source":"registered" if row["source"] else "discovered","checkedAt":iso(row["checked_at"])}
 
     def get_workspace(self, *, id):
         checked_string(id,"workspace ID",128)
         with self.connect() as db:
-            row=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE wi.id=? AND NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.workspace=wi.path)",(id,)).fetchone()
+            row=db.execute("SELECT wi.*,COALESCE((SELECT archived FROM workspace_archives a WHERE a.path=wi.path),0) AS archived,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE wi.id=? AND NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.workspace=wi.path)",(id,)).fetchone()
         return self._workspace_record(row) if row else None
 
-    def list_workspaces(self, *, connectionId, limit=50, cursor=None, search=None, includeHidden=False, includeUnavailable=False, allowedWorkspaceRoots=None):
+    def list_workspaces(self, *, connectionId, limit=50, cursor=None, search=None, includeHidden=False, includeUnavailable=False, allowedWorkspaceRoots=None, archive="active"):
         checked_string(connectionId,"connectionId",200)
+        if archive not in {"active","archived","all"}:raise ValueError("Invalid workspace archive selector")
         if type(limit) is not int or not 1<=limit<=200:raise ValueError("limit must be1..200")
         if type(includeHidden) is not bool or type(includeUnavailable) is not bool:raise ValueError("Workspace visibility flags must be boolean")
         if search is not None:checked_string(search,"search",500)
@@ -730,8 +740,10 @@ class Catalog:
         if roots is not None:
             if not isinstance(roots,list) or len(roots)>128:raise ValueError("Bounded authorized workspace roots required")
             roots=sorted({checked_string(root,"root").rstrip('/') or '/' for root in roots})
-        scope=hashlib.sha256(json.dumps(["workspaces",connectionId,search,includeHidden,includeUnavailable,roots],sort_keys=True).encode()).hexdigest()
+        scope=hashlib.sha256(json.dumps(["workspaces",connectionId,search,includeHidden,includeUnavailable,roots,archive],sort_keys=True).encode()).hexdigest()
         where,args=["NOT EXISTS(SELECT 1 FROM managed_locations ml WHERE ml.workspace=wi.path)"],[]
+        if archive!="all":
+            where.append("COALESCE((SELECT archived FROM workspace_archives a WHERE a.path=wi.path),0)=?");args.append(int(archive=="archived"))
         if not includeHidden:where.append("wi.hidden=0")
         if not includeUnavailable:where.append("wi.availability='present'")
         if search:
@@ -747,7 +759,7 @@ class Catalog:
             if decoded.get('scope')!=scope:raise InvalidCursor("Workspace cursor belongs to another connection or query")
             where.append("(wi.sort_name,wi.path)>(?,?)");args.extend([decoded['name'],decoded['path']])
         with self.connect() as db:
-            rows=db.execute("SELECT wi.*,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE "+(' AND '.join(where) or '1')+" ORDER BY wi.sort_name,wi.path LIMIT ?",[*args,limit+1]).fetchall()
+            rows=db.execute("SELECT wi.*,COALESCE((SELECT archived FROM workspace_archives a WHERE a.path=wi.path),0) AS archived,w.checked_at FROM workspace_index wi JOIN workspaces w ON w.path=wi.path WHERE "+(' AND '.join(where) or '1')+" ORDER BY wi.sort_name,wi.path LIMIT ?",[*args,limit+1]).fetchall()
         result={"items":[self._workspace_record(row) for row in rows[:limit]],"freshness":self.progress()}
         if len(rows)>limit:
             row=rows[limit-1];result['nextCursor']=self._cursor({'scope':scope,'name':row['sort_name'],'path':row['path'],'expires':time.time()+3600})
@@ -770,6 +782,7 @@ class Catalog:
             if not Path(path).is_absolute() or os.path.normpath(path)!=path or row.get('id')!=self.workspace_id(path):raise ValueError("Canonical workspace identity required")
             if type(revision) is not int or not afterRevision<revision<=throughRevision:raise ValueError("Projection record outside batch revision")
             if type(row.get('registered')) is not bool or type(row.get('hidden')) is not bool:raise ValueError("Workspace projection flags required")
+            if type(row.get('archived',False)) is not bool:raise ValueError('Workspace archive flag must be boolean')
             values.append((row,path,name,revision))
         with self.connect() as db:
             old=db.execute("SELECT revision FROM workspace_projection WHERE source=?",(source,)).fetchone();current=old[0] if old else 0
@@ -782,6 +795,7 @@ class Catalog:
                 availability=directory_status(path)
                 db.execute("INSERT INTO workspaces VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET availability=excluded.availability,checked_at=excluded.checked_at",(path,availability,time.time()))
                 db.execute("INSERT INTO workspace_index VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,availability=excluded.availability,registered=excluded.registered,hidden=excluded.hidden,revision=excluded.revision,source=excluded.source",(path,row['id'],name,name.casefold(),availability,int(row['registered']),int(row['hidden']),revision,source))
+                if 'archived' in row:db.execute('INSERT OR REPLACE INTO workspace_archives VALUES(?,?)',(path,int(row['archived'])))
                 if bool(known['hidden'] if known else False)!=row['hidden']:
                     db.execute("UPDATE sessions SET visible=(?='present' AND ?=0 AND NOT EXISTS(SELECT 1 FROM native_visibility v WHERE v.uri=sessions.uri AND v.deleted=1) AND NOT EXISTS(SELECT 1 FROM product_visibility pv WHERE pv.uri=sessions.uri AND pv.hidden=1) AND NOT EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1)) WHERE workspace=?",(availability,int(row['hidden']),path))
             db.execute("INSERT INTO workspace_projection VALUES(?,?) ON CONFLICT(source) DO UPDATE SET revision=excluded.revision",(source,throughRevision))
@@ -814,6 +828,21 @@ class Catalog:
         with self.connect() as db:
             row = db.execute("SELECT uri,fingerprint,EXISTS(SELECT 1 FROM source_presence sp WHERE sp.uri=sessions.uri AND sp.storage_path=sessions.storage_path AND sp.missing=1) AS source_missing FROM sessions WHERE storage_path=? LIMIT 1", (str(path),)).fetchone()
         return dict(row) if row else None
+
+    def workspace_cleanup_census(self):
+        """Cold maintenance metadata only; never a claim about external writers."""
+        with self.connect() as db:
+            rows = [dict(row) for row in db.execute(
+                'SELECT uri,engine,native_id,workspace,storage_path,parent_uri,kind FROM sessions ORDER BY uri LIMIT 10001')]
+        if len(rows) > 10000:
+            raise ValueError('Workspace cleanup census exceeds the bounded index capacity')
+        import hashlib
+        revision = hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return {'version': 1, 'coverage': 'indexed-metadata-only', 'revision': revision,
+                'transcriptBodiesRead': False, 'externalWriterCoverage': False,
+                'items': [{'uri': r['uri'], 'engineId': r['engine'], 'nativeSessionId': r['native_id'],
+                           'workingDirectory': r['workspace'], 'storagePath': r['storage_path'],
+                           'parentUri': r['parent_uri'], 'kind': r['kind']} for r in rows]}
 
     def directory_in_use(self, *, path):
         """Indexed historical references, not a lease on external agent writers.

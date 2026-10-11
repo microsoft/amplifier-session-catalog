@@ -49,3 +49,28 @@ def test_projection_checkpoint_owner_and_revision_conflicts_are_atomic_and_repai
     rebuilt=Catalog(tmp_path/'rebuilt.sqlite');rebuilt.project_workspaces(source='owner',afterRevision=0,throughRevision=1,records=[record])
     assert rebuilt.get_workspace(id=record['id'])['name']==record['name']
     assert rebuilt.list_workspaces(connectionId='a')['items'][0]['available']
+
+
+def test_workspace_archive_is_independent_of_history_visibility_and_cursor_scope(tmp_path):
+    catalog=Catalog(tmp_path/'catalog.sqlite');root=tmp_path/'projects';root.mkdir()
+    for index in range(5):
+        path=root/str(index);path.mkdir()
+        catalog.upsert({'uri':f'ahp-session:/{index}','nativeSessionId':str(index),'engineId':'native','workingDirectory':str(path),'title':f'Chat {index}'})
+        catalog.project_workspaces(source='owner',afterRevision=index,throughRevision=index+1,records=[{**registration(path,revision=index+1,name=f'Workspace {index}'),'archived':index%2==0}])
+    before=catalog.list(connectionId='history')['items']
+    page=catalog.list_workspaces(connectionId='a',archive='archived',limit=2)
+    assert len(page['items'])==2 and all(row['archived'] for row in page['items'])
+    with pytest.raises(ValueError,match='connection or query'):catalog.list_workspaces(connectionId='a',archive='active',cursor=page['nextCursor'])
+    assert len(catalog.list_workspaces(connectionId='a',archive='archived',cursor=page['nextCursor'])['items'])==1
+    assert len(catalog.list_workspaces(connectionId='a',archive='all')['items'])==5
+    assert len(catalog.list_workspaces(connectionId='a')['items'])==2
+    # Discovery and older projections cannot erase a retained archive flag.
+    path=root/'0';catalog.workspace(str(path))
+    catalog.project_workspaces(source='owner',afterRevision=5,throughRevision=6,records=[registration(path,revision=6)])
+    assert catalog.get_workspace(id=Catalog.workspace_id(str(path)))['archived']
+    catalog=Catalog(catalog.path)
+    assert catalog.list(connectionId='history')['items']==before
+    assert catalog.list_workspaces(connectionId='a',archive='archived',search='Display')['items'][0]['path']==str(path)
+    with pytest.raises(ValueError,match='flag'):
+        catalog.project_workspaces(source='owner',afterRevision=6,throughRevision=7,records=[{**registration(path,revision=7),'archived':1}])
+    assert catalog.workspace_projection_status(source='owner')['revision']==6
