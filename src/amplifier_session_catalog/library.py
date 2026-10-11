@@ -1,4 +1,5 @@
 """Live indexed library pages, with bounded current Host facts and query guards."""
+import math
 import hashlib
 import json
 import time
@@ -6,17 +7,26 @@ import uuid
 from .catalog import LibraryRefreshRequired, InvalidCursor, authorized_scope, checked_string, managed_roots, timestamp
 
 
+def checked_navigation(value):
+    if not isinstance(value,dict) or set(value)!={'version','activityAt','agentCreated'} or type(value['version']) is not int or value['version']!=1 or type(value['agentCreated']) is not bool or type(value['activityAt']) not in (int,float) or not math.isfinite(value['activityAt']) or value['activityAt']<0:
+        raise ValueError('Invalid trusted navigation projection')
+    return value
+
+
 def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cursor=None,
                   workingDirectory=None, search=None, parentUri=None, archive='active',
                   sort='activity', activity='all', location='all', allowedManagedRoots=None,
-                  liveFacts=None, observationFreshness=None):
+                  liveFacts=None, observationFreshness=None, navigationVersion=None, includeAgentCreated=None, selectedUri=None):
     checked_string(connectionId,'connectionId',200)
     if type(limit) is not int or not 1<=limit<=50: raise ValueError('Library limit must be1..50')
-    if sort not in {'activity','created','name'} or activity not in {'all','working','attention'} or location not in {'all','managed','missing'} or archive not in {'active','all','archived'}: raise ValueError('Invalid library selector')
+    if sort not in {'activity','created','name','recent'} or activity not in {'all','working','attention'} or location not in {'all','managed','missing'} or archive not in {'active','all','archived'}: raise ValueError('Invalid library selector')
+    if navigationVersion is not None or includeAgentCreated is not None or selectedUri is not None or sort=='recent':
+        if type(navigationVersion) is not int or navigationVersion!=1: raise ValueError('Recent selectors require navigation version1')
+        if includeAgentCreated is not None and type(includeAgentCreated) is not bool: raise ValueError('Agent-created selector must be boolean')
     if not isinstance(allowedWorkspaceRoots,list) or len(allowedWorkspaceRoots)>128: raise ValueError('Explicit bounded workspace grants required')
     roots=sorted(set(checked_string(r,'workspace root').rstrip('/') or '/' for r in allowedWorkspaceRoots))
     managed=managed_roots(allowedManagedRoots)
-    for value,field,bound in [(workingDirectory,'workspace',8192),(parentUri,'parent',512),(search,'search',500)]:
+    for value,field,bound in [(workingDirectory,'workspace',8192),(parentUri,'parent',512),(search,'search',500),(selectedUri,'selected URI',512)]:
         if value is not None: checked_string(value,field,bound)
     facts=liveFacts or {'source':'standalone','incarnation':'unverified','items':[]}
     if not isinstance(facts,dict) or set(facts)!={'source','incarnation','items'}: raise ValueError('Exact live fact envelope required')
@@ -24,15 +34,16 @@ def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cur
     if not isinstance(facts['items'],list) or len(facts['items'])>64 or len(json.dumps(facts).encode())>65536: raise ValueError('Live fact capacity exceeded; do not truncate')
     seen=set()
     for fact in facts['items']:
-        if not isinstance(fact,dict) or set(fact)!={'uri','runtime','effect','modifiedAt'}: raise ValueError('Exact live fact required')
+        if not isinstance(fact,dict) or set(fact)-{'uri','runtime','effect','modifiedAt','navigation'} or not {'uri','runtime','effect','modifiedAt'}<=set(fact): raise ValueError('Exact live fact required')
         uri=checked_string(fact['uri'],'live URI',512)
         if uri in seen or fact['runtime'] not in {'working','input-needed','idle','unknown'} or fact['effect'] not in {'unknown','error','settled','unverified'}: raise ValueError('Invalid live fact')
+        if 'navigation' in fact: checked_navigation(fact['navigation'])
         seen.add(uri)
         if type(fact['modifiedAt']) not in (int,float) or timestamp(fact['modifiedAt'],-1)<0: raise ValueError('Invalid live timestamp')
     freshness=observationFreshness or {'phase':'indexed','issues':[]}
     if not isinstance(freshness,dict) or set(freshness)!={'phase','issues'} or freshness['phase'] not in {'indexed','reconciling','complete','degraded'} or not isinstance(freshness['issues'],list) or len(freshness['issues'])>16: raise ValueError('Invalid observation freshness')
     for issue in freshness['issues']: checked_string(issue,'freshness issue',200)
-    query=dict(connectionId=connectionId,allowedWorkspaceRoots=roots,allowedManagedRoots=managed,workingDirectory=workingDirectory,search=search,parentUri=parentUri,archive=archive,sort=sort,activity=activity,location=location,source=facts['source'],incarnation=facts['incarnation'])
+    query=dict(connectionId=connectionId,allowedWorkspaceRoots=roots,allowedManagedRoots=managed,workingDirectory=workingDirectory,search=search,parentUri=parentUri,archive=archive,sort=sort,activity=activity,location=location,source=facts['source'],incarnation=facts['incarnation'],navigationVersion=navigationVersion,includeAgentCreated=includeAgentCreated,selectedUri=selectedUri)
     scope=hashlib.sha256(json.dumps(query,sort_keys=True).encode()).hexdigest()
     visibility = 's.visible=1'
     if location == 'missing':
@@ -53,21 +64,34 @@ def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cur
     if search:
         where.append("("+' OR '.join('instr(lower('+field+'),lower(?))>0' for field in ['s.title','s.uri','s.native_id','s.workspace','wi.name'])+")")
         args += [search]*5
+    if navigationVersion==1 and not includeAgentCreated and not parentUri:
+        where.append("coalesce(json_extract(s.details,'$.hostObservation.navigation.agentCreated'),0)=0")
     pred=' AND '.join(where)
     effect="coalesce(json_extract(s.details,'$.hostObservation.effect'),'unverified')"
     base_kind=f"CASE WHEN {effect} IN ('error','unknown') THEN 'attention' ELSE 'unknown' END"
     live_effect="json_extract(lf.value,'$.effect')";live_runtime="json_extract(lf.value,'$.runtime')"
     live_kind=f"CASE WHEN {live_effect} IN ('error','unknown') OR {live_runtime}='input-needed' THEN 'attention' WHEN {live_runtime}='working' THEN 'working' WHEN {live_runtime}='idle' THEN 'idle' ELSE 'unknown' END"
-    key={'activity':'s.modified_at','created':'s.created_at','name':'lower(s.title)'}[sort]
+    key={'activity':'s.modified_at','recent':"coalesce(json_extract(s.details,'$.hostObservation.navigation.activityAt'),s.modified_at)",'created':'s.created_at','name':'lower(s.title)'}[sort]
     live_key="json_extract(lf.value,'$.modifiedAt')" if sort=='activity' else key
+    if sort=='recent': live_key="coalesce(json_extract(lf.value,'$.navigation.activityAt'),"+key+")"
     joins=' JOIN workspaces w ON w.path=s.workspace LEFT JOIN workspace_index wi ON wi.path=s.workspace '
     common="s.*,COALESCE((SELECT archived FROM session_archive a WHERE a.uri=s.uri),0) AS is_archived,w.availability AS workspace_availability,"
     base=f"SELECT {common}{key} AS library_key,{base_kind} AS library_kind,'unknown' AS library_runtime,{effect} AS library_effect,'indexed' AS library_evidence FROM sessions s {joins} WHERE {pred} AND s.uri NOT IN (SELECT json_extract(value,'$.uri') FROM json_each(?))"
     base_args=[*args,json.dumps(facts['items'])]
     if activity=='working': base+=' AND 0'
     elif activity=='attention': base+=f" AND {effect} IN ('error','unknown')"
+    statements=[(base,base_args,key)]
+    if navigationVersion==1 and not includeAgentCreated and not parentUri and selectedUri:
+        # A point lookup keeps the selected agent-created chat eligible without
+        # turning the indexed human-only scan into an estate-wide OR scan.
+        selected=base.replace("coalesce(json_extract(s.details,'$.hostObservation.navigation.agentCreated'),0)=0","coalesce(json_extract(s.details,'$.hostObservation.navigation.agentCreated'),0)=1")+' AND s.uri=?'
+        statements.append((selected,[*base_args,selectedUri],key))
     live=f"SELECT {common}{live_key} AS library_key,{live_kind} AS library_kind,{live_runtime} AS library_runtime,{live_effect} AS library_effect,'current-host' AS library_evidence FROM json_each(?) lf CROSS JOIN sessions s ON s.uri=json_extract(lf.value,'$.uri') {joins} WHERE {pred}"
+    if navigationVersion==1 and not includeAgentCreated and not parentUri:
+        selector="coalesce(json_extract(lf.value,'$.navigation.agentCreated'),json_extract(s.details,'$.hostObservation.navigation.agentCreated'),0)=0"
+        live=live.replace("coalesce(json_extract(s.details,'$.hostObservation.navigation.agentCreated'),0)=0",'('+selector+' OR s.uri=?)' if selectedUri else selector)
     live_args=[json.dumps(facts['items']),*args]
+    if navigationVersion==1 and not includeAgentCreated and not parentUri and selectedUri:live_args.append(selectedUri)
     if activity!='all': live+=f' AND ({live_kind})=?';live_args.append(activity)
     ascending=sort=='name';direction='ASC' if ascending else 'DESC'
     with catalog.library_lock, catalog.connect() as db:
@@ -85,7 +109,7 @@ def library_query(catalog, *, connectionId, allowedWorkspaceRoots, limit=50, cur
             if not guard or guard['dirty'] or guard['liveStamp']!=stamp: raise LibraryRefreshRequired('Library changed or expired; refresh the first page')
             catalog.library_guards.move_to_end(guard_id)
         parts=[];sql_args=[]
-        for statement,bindings,order_key in [(base,base_args,key),(live,live_args,live_key)]:
+        for statement,bindings,order_key in [*statements,(live,live_args,live_key)]:
             if decoded:
                 parts += [statement+f' AND {order_key}=? AND s.uri>?',statement+f" AND {order_key}{'>' if ascending else '<'}?"]
                 sql_args += [*bindings,decoded['key'],decoded['uri'],*bindings,decoded['key']]

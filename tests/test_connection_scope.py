@@ -89,7 +89,7 @@ def test_real_scan_keeps_individual_commits_and_closes_handle(tmp_path,monkeypat
         opened.clear();closed.clear();sql.clear()
         assert d.scan()['issues']==0
         assert len(opened)==1 and closed==opened
-        assert sum(s.strip().upper().startswith('CREATE TEMP TRIGGER') for s in sql)==10
+        assert sum(s.strip().upper().startswith('CREATE TEMP TRIGGER') for s in sql)==12
         assert sum(s.strip().upper()=='COMMIT' for s in sql)==expected_commits
     assert len(c.list_workspaces(connectionId='same-process')['items'])==4
 

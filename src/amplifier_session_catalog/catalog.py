@@ -193,6 +193,9 @@ class Catalog:
                        (json.dumps(str(uuid.uuid4())),))
         with self.connect() as db:
             db.executescript("""
+                CREATE INDEX IF NOT EXISTS library_recent ON sessions(visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
+                CREATE INDEX IF NOT EXISTS library_human_recent ON sessions(visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.agentCreated'),0),coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
+                CREATE INDEX IF NOT EXISTS library_workspace_recent ON sessions(workspace,visible,kind,coalesce(json_extract(details,'$.hostObservation.navigation.activityAt'),modified_at) DESC,uri);
                 CREATE INDEX IF NOT EXISTS library_created ON sessions(visible,kind,created_at DESC,uri);
                 CREATE INDEX IF NOT EXISTS library_name ON sessions(visible,kind,lower(title),uri);
                 CREATE INDEX IF NOT EXISTS library_attention_activity ON sessions(visible,kind,modified_at DESC,uri) WHERE coalesce(json_extract(details,'$.hostObservation.effect'),'unverified') IN ('error','unknown');
@@ -245,6 +248,8 @@ class Catalog:
                     CREATE TEMP TRIGGER library_membership AFTER UPDATE ON main.sessions WHEN OLD.visible<>NEW.visible OR OLD.kind<>NEW.kind OR OLD.workspace<>NEW.workspace OR OLD.parent_uri IS NOT NEW.parent_uri OR OLD.native_id<>NEW.native_id OR json_extract(OLD.details,'$.location') IS NOT json_extract(NEW.details,'$.location') BEGIN SELECT library_changed(OLD.workspace,'membership'); SELECT library_changed(NEW.workspace,'membership'); END;
                     CREATE TEMP TRIGGER library_title AFTER UPDATE OF title ON main.sessions WHEN OLD.title<>NEW.title BEGIN SELECT library_changed(NEW.workspace,'title'); END;
                     CREATE TEMP TRIGGER library_activity AFTER UPDATE OF modified_at ON main.sessions WHEN OLD.modified_at<>NEW.modified_at BEGIN SELECT library_changed(NEW.workspace,'activity'); END;
+                    CREATE TEMP TRIGGER library_recent AFTER UPDATE ON main.sessions WHEN coalesce(json_extract(OLD.details,'$.hostObservation.navigation.activityAt'),OLD.modified_at) IS NOT coalesce(json_extract(NEW.details,'$.hostObservation.navigation.activityAt'),NEW.modified_at) BEGIN SELECT library_changed(NEW.workspace,'recent'); END;
+                    CREATE TEMP TRIGGER library_agent_created AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.navigation.agentCreated') IS NOT json_extract(NEW.details,'$.hostObservation.navigation.agentCreated') BEGIN SELECT library_changed(NEW.workspace,'agent-created'); END;
                     CREATE TEMP TRIGGER library_created AFTER UPDATE OF created_at ON main.sessions WHEN OLD.created_at<>NEW.created_at BEGIN SELECT library_changed(NEW.workspace,'created'); END;
                     CREATE TEMP TRIGGER library_effect AFTER UPDATE OF details ON main.sessions WHEN json_extract(OLD.details,'$.hostObservation.effect') IS NOT json_extract(NEW.details,'$.hostObservation.effect') BEGIN SELECT library_changed(NEW.workspace,'effect'); END;
                     CREATE TEMP TRIGGER library_archive_insert AFTER INSERT ON main.session_archive BEGIN SELECT library_changed(workspace,'membership') FROM sessions WHERE uri=NEW.uri; END;
@@ -281,7 +286,7 @@ class Catalog:
                     for workspace,fields in state['events']:
                         if q.get('workingDirectory') and q['workingDirectory']!=workspace: continue
                         if not any(workspace==r or workspace.startswith(r.rstrip('/')+'/') for r in [*q['allowedWorkspaceRoots'],*(q.get('allowedManagedRoots') or [])]): continue
-                        if fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
+                        if fields=='recent' and q['sort']=='recent' or fields=='agent-created' and q.get('navigationVersion')==1 and not q.get('includeAgentCreated') or fields=='membership' or fields=='title' and (q['sort']=='name' or q.get('search')) or fields=='activity' and q['sort']=='activity' or fields=='created' and q['sort']=='created' or fields=='effect' and q['activity']!='all':
                             guard['dirty']=True
                             break
         except BaseException:
@@ -460,8 +465,11 @@ class Catalog:
             observation = json.loads(previous['details']).get('hostObservation') if previous else None
             if source == 'host' and 'hostObservation' in record:
                 candidate = record['hostObservation']
-                if not isinstance(candidate,dict) or set(candidate)!={'version','source','incarnation','revision','observedAt','effect','unknownChecked'} or type(candidate['version']) is not int or candidate['version']!=1 or type(candidate['revision']) is not int or candidate['revision']<0 or candidate['effect'] not in {'unverified','settled','error','unknown'} or candidate['unknownChecked'] is not True:
+                if not isinstance(candidate,dict) or set(candidate)-{'version','source','incarnation','revision','observedAt','effect','unknownChecked','navigation'} or not {'version','source','incarnation','revision','observedAt','effect','unknownChecked'}<=set(candidate) or type(candidate['version']) is not int or candidate['version']!=1 or type(candidate['revision']) is not int or candidate['revision']<0 or candidate['effect'] not in {'unverified','settled','error','unknown'} or candidate['unknownChecked'] is not True:
                     raise ValueError('Invalid checked Host observation')
+                if 'navigation' in candidate:
+                    from .library import checked_navigation
+                    checked_navigation(candidate['navigation'])
                 for key in ('source','incarnation','observedAt'): checked_string(candidate[key],key,200)
                 if timestamp(candidate['observedAt'],-1)<0:raise ValueError('Invalid observation time')
                 if observation and observation['source']!=candidate['source']: raise ValueError('Host observation belongs to another source')
