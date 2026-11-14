@@ -1,5 +1,7 @@
 # Catalog contributor entry
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 Read [VISION.md](VISION.md), [catalog contract v1](contracts/catalog.v1.md) and the
 [README](README.md) before changing behavior. Follow the linked approved family
 ownership and protocol clauses; upstream AHP/ACP retain wire authority.
