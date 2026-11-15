@@ -3,9 +3,9 @@
 This is the local entry point for inherited approved discovery and ownership
 promises, implemented API obligations and their falsifiers. It does not replace
 upstream wire schemas or ratify new product scope. Exact method shapes and bounds
-remain in the [README](../README.md#stdio-interface-v1); product visibility uses
+remain in the [integration reference](../docs/integration.md#stdio-interface-v1); product visibility uses
 [its existing v1 contract](product-visibility.v1.json) and
-[host rebuild handshake](../README.md#host-snapshotrebuild-handshake).
+[host rebuild handshake](../docs/integration.md#host-snapshotrebuild-handshake).
 
 ## Authority and consumers
 
@@ -35,7 +35,7 @@ must not become invented standard wire fields.
 | C5: Safety discovery includes excluded histories and refuses incomplete coverage as proof (WS1; CS7). | Hidden/internal/deleted rows disappear from a directory or family guard, or cycles/overflow produce complete proof. | [descendant tests](../tests/test_descendants.py), [retention tests](../tests/test_retention_candidates.py) and directory-use tests in [catalog tests](../tests/test_catalog.py). |
 | C6: Product visibility stays distinct from native deletion; apply bounded source-exclusive CAS batches with exact recoverable receipts (CS4/CS7; CB3). | Native recheck revives product exclusion, retry rewinds a newer restore, a source takes over, or invalid batches partly apply. | [product tests](../tests/test_product_visibility.py): independent reindex/native-byte preservation, restart/newer-revision recovery, atomic rollback, source conflict, concurrent CAS, complete visible paging and contiguous snapshot replay. This is the agreed additive candidate seam, not ratification of host reset effects. |
 
-| C7: A selected repair binds current bounded native namespace and configured lifecycle facts, with separate under-lease physical verification (WS1/WS3/WS5/WS6; AP3). | Stale global status is relabelled fresh, lifecycle reads escape shared byte/file budgets or verification, unknown children bypass leases, or a cached index revision is accepted as proof against an unhinted new child. | [family reconciliation tests](../tests/test_family_reconciliation.py): stale global reproduction, root/child preservation, unknown child after proof, passive verifier, source/entry/byte/race refusal, lifecycle overflow/FIFO/changed-marker refusal, visibility preservation and restart expiry. [Selected family protocol](../README.md#selected-native-family-repair-and-verification-v1). |
+| C7: A selected repair binds current bounded native namespace and configured lifecycle facts, with separate under-lease physical verification (WS1/WS3/WS5/WS6; AP3). | Stale global status is relabelled fresh, lifecycle reads escape shared byte/file budgets or verification, unknown children bypass leases, or a cached index revision is accepted as proof against an unhinted new child. | [family reconciliation tests](../tests/test_family_reconciliation.py): stale global reproduction, root/child preservation, unknown child after proof, passive verifier, source/entry/byte/race refusal, lifecycle overflow/FIFO/changed-marker refusal, visibility preservation and restart expiry. [Selected family protocol](../docs/integration.md#selected-native-family-repair-and-verification-v1). |
 
 ## Selected-source absence
 
@@ -47,7 +47,7 @@ exclusion. Safety lookups retain historical rows. [Presence tests](../tests/test
 cover independent exclusions, current-fact duplicate hints, unsafe/unknown sources,
 stale binding and replacement races, restart, child safety and bounded 25k-row work.
 Index loss also loses observations; the host rebuild fence remains required until
-known selected locations are reobserved. See [the discovery rule](../README.md#reversible-selected-source-absence).
+known selected locations are reobserved. See [the discovery rule](../docs/integration.md#reversible-selected-source-absence).
 
 ## Consumer obligations
 
@@ -89,7 +89,7 @@ no runtime feature and does not self-ratify pending product decisions.
 The trusted product projection status now includes an immutable database
 `indexIncarnation` and computed `projectionPresent` alongside compatible
 source/revision fields. The [product visibility contract](product-visibility.v1.json)
-and [README lifecycle](../README.md#index-continuity-and-compatibility) define
+and [index continuity](../docs/integration.md#index-continuity-and-compatibility) define
 transactional initialization, one-snapshot reads, legacy and copy/restore limits.
 [Continuity tests](../tests/test_index_incarnation.py) cover retention, recreation,
 legacy preservation, failed initialization and concurrent snapshot/initialization.
