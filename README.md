@@ -46,6 +46,27 @@ The catalog never deletes native history or starts work.
 - [Catalog contract](contracts/catalog.v1.md): ownership and consumer obligations
 - [Working instructions](AGENTS.md)
 
+
+<!-- ecosystem-map:start -->
+## Where this fits
+
+A reusable metadata index for conversation discovery; native history stays authoritative.
+
+Supports: Conversation, Experience.
+
+![Ecosystem roles and component relationships](docs/ecosystem-map.svg)
+
+[Open the map](docs/ecosystem-map.svg) · [Product page source (private)](docs/product/index.html) · [Map guide](https://github.com/microsoft/amplifier-constellation/blob/main/docs/ecosystem-maps.md)
+
+<details>
+<summary>The five shared building blocks</summary>
+
+[![Experience, Conversation, Agent Instance, Connection and Tool](https://raw.githubusercontent.com/microsoft/amplifier-constellation/main/site/assets/art/building-blocks.png)](https://microsoft.github.io/amplifier-constellation/)
+
+</details>
+
+<!-- ecosystem-map:end -->
+
 ## Contributing
 
 Most contributions require you to agree to a
