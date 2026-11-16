@@ -1,18 +1,18 @@
 {
   "citations": [
     {
-      "git_blob": "0acb7a17c5b2670b201cb879ca3b3e6d4619abdc",
+      "git_blob": "1d9791021850bfffd2932ed5791e61c6e2ed4fa2",
       "path": "README.md",
-      "ref": "c22189b44d5b495869f1b86a867b7a4598b862e0",
-      "sha256": "c422adee0c0d31a08171f31b46f1344b6480473bd4eb3e9d684da541fc51d9e3",
-      "url": "https://github.com/microsoft/amplifier-session-catalog/blob/c22189b44d5b495869f1b86a867b7a4598b862e0/README.md"
+      "ref": "db9987269898c57fc8e6ea28fa3839c97eb3bb3d",
+      "sha256": "864cecd0fed6c3957934f6fd2b4d2897f2e69d8b639e1aa3f26393f60d4ee348",
+      "url": "https://github.com/microsoft/amplifier-session-catalog/blob/db9987269898c57fc8e6ea28fa3839c97eb3bb3d/README.md"
     },
     {
       "git_blob": "795d06204c9bbc64d9f6d3a9dec60acf9e9c88fa",
       "path": "contracts/catalog.v1.md",
-      "ref": "c22189b44d5b495869f1b86a867b7a4598b862e0",
+      "ref": "db9987269898c57fc8e6ea28fa3839c97eb3bb3d",
       "sha256": "e6ad18ee9136e0469fdc28da5a6b3bfe2e907151a9b8bd0edbdd6c6e83872f24",
-      "url": "https://github.com/microsoft/amplifier-session-catalog/blob/c22189b44d5b495869f1b86a867b7a4598b862e0/contracts/catalog.v1.md"
+      "url": "https://github.com/microsoft/amplifier-session-catalog/blob/db9987269898c57fc8e6ea28fa3839c97eb3bb3d/contracts/catalog.v1.md"
     }
   ],
   "consumer_cta": {
@@ -88,7 +88,7 @@
     "Depict a reusable component with consumers, not a fixed child of a particular web client."
   ],
   "purpose": "Find Amplifier conversations and workspaces from native metadata without loading an agent.",
-  "ref": "c22189b44d5b495869f1b86a867b7a4598b862e0",
+  "ref": "db9987269898c57fc8e6ea28fa3839c97eb3bb3d",
   "repository": "microsoft/amplifier-session-catalog",
   "roles": [],
   "scope": "shared local metadata component",
@@ -102,5 +102,5 @@
     "Conversation",
     "Experience"
   ],
-  "visibility": "private"
+  "visibility": "public"
 }
